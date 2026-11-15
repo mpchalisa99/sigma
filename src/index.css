@@ -1,0 +1,90 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+@import "leaflet/dist/leaflet.css";
+
+@layer base {
+  :root {
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --font-display: 'Chakra Petch', 'JetBrains Mono', sans-serif;
+  }
+
+  body {
+    font-family: var(--font-mono);
+    background-color: #000000;
+    color: #e0f2fe;
+    margin: 0;
+    padding: 0;
+    overflow-x: hidden;
+  }
+}
+
+.font-display-tactical {
+  font-family: var(--font-display);
+}
+
+.font-mono-tactical {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Tactical cyan glow effects */
+.text-glow-cyan {
+  text-shadow: 0 0 12px rgba(0, 255, 255, 0.55), 0 0 2px rgba(0, 255, 255, 0.8);
+}
+
+.border-glow-cyan {
+  box-shadow: 0 0 15px rgba(0, 255, 255, 0.12), inset 0 0 12px rgba(0, 255, 255, 0.05);
+}
+
+/* Custom Tactical Leaflet Map Styling */
+.sigma-leaflet-map {
+  background: #040911 !important;
+}
+
+.sigma-leaflet-map .leaflet-tile-pane {
+  filter: brightness(0.78) contrast(1.22) saturate(0.65) hue-rotate(155deg);
+}
+
+.sigma-leaflet-map .leaflet-control-attribution {
+  background: rgba(2, 6, 14, 0.75) !important;
+  color: rgba(0, 255, 255, 0.45) !important;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  border-top: 1px solid rgba(0, 255, 255, 0.15);
+}
+
+.sigma-leaflet-map .leaflet-control-attribution a {
+  color: rgba(0, 255, 255, 0.65) !important;
+}
+
+.sigma-node-marker-icon {
+  background: transparent !important;
+  border: none !important;
+}
+
+/* Subtle tactical grid overlay */
+.tactical-grid-bg {
+  background-image: 
+    linear-gradient(to right, rgba(0, 255, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(0, 255, 255, 0.05) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+/* Custom slim scrollbars */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: #02060d;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #0e3a4c;
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #00ffff;
+}

@@ -1,0 +1,12 @@
+{
+  "name": "Remix S.I.G.M.A. Remote Audio Telemetry Dashboard",
+  "description": "Tactical peer-to-peer WebRTC remote environmental audio telemetry, GPS tracking, and VOX automatic recording system.",
+  "requestFramePermissions": [
+    "microphone",
+    "geolocation",
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
