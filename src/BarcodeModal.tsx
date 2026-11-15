@@ -15,6 +15,7 @@ import {
   X,
   ShieldCheck,
   RefreshCw,
+  SwitchCamera,
 } from 'lucide-react';
 import { usePWAInstall } from './usePWAInstall';
 
@@ -25,6 +26,12 @@ export interface BarcodeModalProps {
   defaultNodeId?: string;
   masterPeerId?: string;
   onScanNodeId?: (nodeId: string, masterId?: string) => void;
+}
+
+interface BarcodeDetectorLike {
+  detect: (
+    source: HTMLVideoElement | HTMLCanvasElement | ImageBitmap
+  ) => Promise<Array<{ rawValue?: string }>>;
 }
 
 /**
@@ -55,11 +62,12 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
   const [activeTab, setActiveTab] = useState<'CLIENT_JOIN' | 'SHARE_APK' | 'SCANNER'>(
     initialTab
   );
-  const [selectedNodeId, setSelectedNodeId] = useState<string>(() =>
-    defaultNodeId && /^\d{4}$/.test(defaultNodeId)
-      ? defaultNodeId
-      : String(Math.floor(1000 + Math.random() * 9000))
-  );
+  const [selectedNodeId, setSelectedNodeId] = useState<string>(() => {
+    const clean = defaultNodeId?.replace('sigma-node-', '').trim();
+    return clean && /^\d{4}$/.test(clean)
+      ? clean
+      : String(Math.floor(1000 + Math.random() * 9000));
+  });
   const [apkTargetRole, setApkTargetRole] = useState<'NODE_CLIENT' | 'FULL_SUITE'>(
     'NODE_CLIENT'
   );
@@ -68,6 +76,9 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
   const [scanResult, setScanResult] = useState<string | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
   const [cameraActive, setCameraActive] = useState<boolean>(false);
+  const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
+  const [retrySeed, setRetrySeed] = useState<number>(0);
+  const [manualCodeInput, setManualCodeInput] = useState<string>('');
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const scanCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -79,24 +90,26 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
   useEffect(() => {
     if (isOpen) {
       setActiveTab(initialTab);
-      if (defaultNodeId && /^\d{4}$/.test(defaultNodeId)) {
-        setSelectedNodeId(defaultNodeId);
+      const clean = defaultNodeId?.replace('sigma-node-', '').trim();
+      if (clean && /^\d{4}$/.test(clean)) {
+        setSelectedNodeId(clean);
       }
     }
   }, [isOpen, initialTab, defaultNodeId]);
 
   const baseOrigin = typeof window !== 'undefined' ? window.location.origin : '';
+  const effectiveMasterId = masterPeerId || 'sigma-master-main';
 
   const clientJoinUrl = `${baseOrigin}/?mode=node&id=${encodeURIComponent(
     selectedNodeId
-  )}${masterPeerId ? `&master=${encodeURIComponent(masterPeerId)}` : ''}`;
+  )}&master=${encodeURIComponent(effectiveMasterId)}`;
 
   const shareApkUrl =
     apkTargetRole === 'NODE_CLIENT'
-      ? `${baseOrigin}/?mode=node&id=${encodeURIComponent(selectedNodeId)}&install=apk${
-          masterPeerId ? `&master=${encodeURIComponent(masterPeerId)}` : ''
-        }`
-      : `${baseOrigin}/?install=apk`;
+      ? `${baseOrigin}/?mode=node&id=${encodeURIComponent(
+          selectedNodeId
+        )}&install=apk&master=${encodeURIComponent(effectiveMasterId)}`
+      : `${baseOrigin}/?install=apk&master=${encodeURIComponent(effectiveMasterId)}`;
 
   const activeUrl = activeTab === 'SHARE_APK' ? shareApkUrl : clientJoinUrl;
   const linearBarcodeText =
@@ -104,17 +117,18 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
       ? `SIGMA-APK-${apkTargetRole === 'NODE_CLIENT' ? selectedNodeId : 'FULL'}`
       : `SIGMA-NODE-${selectedNodeId}`;
 
+  // Gunakan kontras tinggi (Hitam di atas Putih) agar 100% mudah dibaca oleh kamera HP / Samsung / WebAPK
   useEffect(() => {
     if (!isOpen || activeTab === 'SCANNER') return;
     let mounted = true;
     QRCode.toDataURL(activeUrl, {
-      width: 320,
-      margin: 2,
+      width: 340,
+      margin: 3,
       color: {
-        dark: '#00FFFF',
-        light: '#030812',
+        dark: '#02060d',
+        light: '#FFFFFF',
       },
-      errorCorrectionLevel: 'M',
+      errorCorrectionLevel: 'H',
     })
       .then((url) => {
         if (mounted) setQrDataUrl(url);
@@ -128,18 +142,23 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
   const handleDecodedPayload = useCallback(
     (rawText: string) => {
       const text = rawText.trim();
+      if (!text) return;
       setScanResult(text);
 
-      const directMatch = text.match(/(?:SIGMA-NODE-|^)(\d{4})$/i);
-      if (directMatch && onScanNodeId) {
-        onScanNodeId(directMatch[1]);
-        onClose();
-        return;
+      // 1. Format langsung: "7734" atau "SIGMA-NODE-7734" atau "sigma-node-7734"
+      const directMatch = text.match(/(?:SIGMA-NODE-|sigma-node-|^)(\d{4})$/i);
+      if (directMatch) {
+        if (onScanNodeId) {
+          onScanNodeId(directMatch[1], effectiveMasterId);
+          onClose();
+          return;
+        }
       }
 
+      // 2. Format URL lengkap: https://.../?mode=node&id=7734&master=sigma-master-main
       try {
         const parsed = new URL(text);
-        const idParam = parsed.searchParams.get('id');
+        const idParam = parsed.searchParams.get('id')?.replace('sigma-node-', '');
         const masterParam = parsed.searchParams.get('master') || undefined;
         if (idParam && /^\d{4}$/.test(idParam)) {
           if (onScanNodeId) {
@@ -151,15 +170,21 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
             return;
           }
         }
+        if (masterParam && onScanNodeId) {
+          onScanNodeId(selectedNodeId, masterParam);
+          onClose();
+          return;
+        }
       } catch {}
 
+      // 3. Cari 4 digit angka di dalam string
       const anyFourDigits = text.match(/\b(\d{4})\b/);
       if (anyFourDigits && onScanNodeId) {
-        onScanNodeId(anyFourDigits[1]);
+        onScanNodeId(anyFourDigits[1], effectiveMasterId);
         onClose();
       }
     },
-    [onClose, onScanNodeId]
+    [effectiveMasterId, onClose, onScanNodeId, selectedNodeId]
   );
 
   const stopCamera = useCallback(() => {
@@ -168,12 +193,23 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
       rafRef.current = null;
     }
     if (cameraStreamRef.current) {
-      cameraStreamRef.current.getTracks().forEach((t) => t.stop());
+      cameraStreamRef.current.getTracks().forEach((t) => {
+        try {
+          t.stop();
+        } catch {}
+      });
       cameraStreamRef.current = null;
+    }
+    if (videoRef.current) {
+      try {
+        videoRef.current.pause();
+        videoRef.current.srcObject = null;
+      } catch {}
     }
     setCameraActive(false);
   }, []);
 
+  // Akuisisi Kamera Bertingkat (4-Stage Fallback) untuk kompatibilitas Vercel / WebAPK / Samsung Android
   useEffect(() => {
     if (!isOpen || activeTab !== 'SCANNER') {
       stopCamera();
@@ -184,52 +220,178 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
     setScanError(null);
     setScanResult(null);
 
-    async function startScanner() {
+    async function acquireCameraStream(
+      preferredFacing: 'environment' | 'user'
+    ): Promise<MediaStream> {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('API Kamera (navigator.mediaDevices) tidak tersedia.');
+      }
+
+      // Stage 1: Ideal resolution + preferred facingMode
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment' },
+        return await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: preferredFacing },
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+          },
           audio: false,
         });
+      } catch {}
+
+      // Stage 2: Simple facingMode constraint
+      try {
+        return await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: preferredFacing },
+          audio: false,
+        });
+      } catch {}
+
+      // Stage 3: Enumerate videoinput devices and pick matching camera explicitly
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = devices.filter((d) => d.kind === 'videoinput');
+        if (videoDevices.length > 0) {
+          const backCam = videoDevices.find((d) =>
+            /back|rear|environment|belakang|0/i.test(d.label)
+          );
+          const chosen =
+            preferredFacing === 'environment'
+              ? backCam || videoDevices[videoDevices.length - 1]
+              : videoDevices[0];
+          if (chosen && chosen.deviceId) {
+            return await navigator.mediaDevices.getUserMedia({
+              video: { deviceId: { exact: chosen.deviceId } },
+              audio: false,
+            });
+          }
+        }
+      } catch {}
+
+      // Stage 4: Ultimate fallback — any available video camera
+      return await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: false,
+      });
+    }
+
+    async function startScanner() {
+      stopCamera();
+
+      try {
+        const stream = await acquireCameraStream(facingMode);
         if (cancelled) {
           stream.getTracks().forEach((t) => t.stop());
           return;
         }
-        cameraStreamRef.current = stream;
-        setCameraActive(true);
 
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play().catch(() => {});
+        cameraStreamRef.current = stream;
+
+        const video = videoRef.current;
+        if (video) {
+          video.setAttribute('autoplay', '');
+          video.setAttribute('playsinline', '');
+          video.setAttribute('webkit-playsinline', '');
+          video.muted = true;
+          video.srcObject = stream;
+
+          await new Promise<void>((resolve) => {
+            const timeoutId = window.setTimeout(resolve, 1200);
+            video.onloadedmetadata = () => {
+              clearTimeout(timeoutId);
+              resolve();
+            };
+          });
+
+          if (cancelled) return;
+          await video.play().catch(() => {});
+          setCameraActive(true);
         }
+
+        // Gunakan BarcodeDetector hardware bawaan Android/Samsung Chrome jika tersedia
+        let nativeDetector: BarcodeDetectorLike | null = null;
+        const winWithDetector = window as unknown as {
+          BarcodeDetector?: new (opts?: { formats?: string[] }) => BarcodeDetectorLike;
+        };
+        if (typeof winWithDetector.BarcodeDetector === 'function') {
+          try {
+            nativeDetector = new winWithDetector.BarcodeDetector({
+              formats: ['qr_code', 'code_128', 'code_39', 'ean_13'],
+            });
+          } catch {
+            try {
+              nativeDetector = new winWithDetector.BarcodeDetector();
+            } catch {}
+          }
+        }
+
+        let isDetectingNative = false;
 
         const scanLoop = () => {
           if (cancelled) return;
-          const video = videoRef.current;
+          const v = videoRef.current;
           const canvas = scanCanvasRef.current;
-          if (video && canvas && video.readyState === video.HAVE_ENOUGH_DATA) {
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            const ctx = canvas.getContext('2d');
-            if (ctx) {
-              ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-              const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-              const code = jsQR(imgData.data, imgData.width, imgData.height, {
-                inversionAttempts: 'attemptBoth',
-              });
-              if (code && code.data) {
-                handleDecodedPayload(code.data);
-                return;
-              }
+
+          if (
+            v &&
+            canvas &&
+            v.readyState >= 2 &&
+            v.videoWidth > 0 &&
+            v.videoHeight > 0
+          ) {
+            // 1. Jalankan hardware BarcodeDetector secara asinkron jika didukung
+            if (nativeDetector && !isDetectingNative) {
+              isDetectingNative = true;
+              nativeDetector
+                .detect(v)
+                .then((results) => {
+                  if (!cancelled && results && results.length > 0 && results[0].rawValue) {
+                    handleDecodedPayload(results[0].rawValue);
+                  }
+                })
+                .catch(() => {})
+                .finally(() => {
+                  isDetectingNative = false;
+                });
             }
+
+            // 2. Jalankan jsQR pada canvas berukuran optimal (maks 480px) agar cepat & ringan di HP
+            try {
+              const maxDim = 480;
+              const scale = Math.min(
+                1,
+                maxDim / Math.max(v.videoWidth, v.videoHeight)
+              );
+              const cw = Math.max(1, Math.floor(v.videoWidth * scale));
+              const ch = Math.max(1, Math.floor(v.videoHeight * scale));
+
+              if (canvas.width !== cw) canvas.width = cw;
+              if (canvas.height !== ch) canvas.height = ch;
+
+              const ctx = canvas.getContext('2d', { willReadFrequently: true });
+              if (ctx) {
+                ctx.drawImage(v, 0, 0, cw, ch);
+                const imgData = ctx.getImageData(0, 0, cw, ch);
+                const code = jsQR(imgData.data, imgData.width, imgData.height, {
+                  inversionAttempts: 'attemptBoth',
+                });
+                if (code && code.data) {
+                  handleDecodedPayload(code.data);
+                  return;
+                }
+              }
+            } catch {}
           }
+
           rafRef.current = requestAnimationFrame(scanLoop);
         };
 
         rafRef.current = requestAnimationFrame(scanLoop);
-      } catch {
+      } catch (err) {
         if (!cancelled) {
+          const msg = err instanceof Error ? err.message : String(err);
           setScanError(
-            'Kamera tidak dapat diakses di perangkat ini. Gunakan tombol Upload Gambar Barcode di bawah.'
+            `Kamera belum diizinkan atau sedang dipakai aplikasi lain (${msg}). Ketuk "MUAT ULANG KAMERA", pilih "UPLOAD GAMBAR", atau masukkan 4-digit ID secara manual di bawah.`
           );
           setCameraActive(false);
         }
@@ -242,7 +404,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
       cancelled = true;
       stopCamera();
     };
-  }, [isOpen, activeTab, handleDecodedPayload, stopCamera]);
+  }, [isOpen, activeTab, facingMode, retrySeed, handleDecodedPayload, stopCamera]);
 
   const handleImageFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -254,11 +416,13 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
       const img = new Image();
       img.onload = () => {
         const canvas = document.createElement('canvas');
-        canvas.width = img.width;
-        canvas.height = img.height;
+        const maxDim = 800;
+        const scale = Math.min(1, maxDim / Math.max(img.width || 1, img.height || 1));
+        canvas.width = Math.max(1, Math.floor(img.width * scale));
+        canvas.height = Math.max(1, Math.floor(img.height * scale));
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
-        ctx.drawImage(img, 0, 0);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
         const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const code = jsQR(imgData.data, imgData.width, imgData.height, {
           inversionAttempts: 'attemptBoth',
@@ -312,6 +476,8 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
         img.onerror = () => resolve();
         img.src = qrDataUrl;
       });
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect((canvas.width - 332) / 2, 104, 332, 332);
       ctx.drawImage(img, (canvas.width - 320) / 2, 110, 320, 320);
     }
 
@@ -393,7 +559,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
   const linearBars = generateLinearBars(linearBarcodeText);
 
   return (
-    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/85 backdrop-blur-xs p-3 sm:p-4 select-none">
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/85 backdrop-blur-xs p-3 sm:p-4 select-none pointer-events-auto">
       <div className="w-full max-w-xl bg-[#040b16] border border-cyan-500/55 rounded p-4 sm:p-6 text-cyan-50 font-mono-tactical shadow-2xl border-glow-cyan max-h-[94vh] overflow-y-auto">
         <div className="flex items-center justify-between pb-3 border-b border-cyan-500/30">
           <div className="flex items-center gap-2">
@@ -409,6 +575,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
           </div>
 
           <button
+            type="button"
             onClick={onClose}
             className="p-1.5 text-slate-400 hover:text-cyan-300 bg-cyan-950/30 border border-cyan-500/30 rounded cursor-pointer"
           >
@@ -418,6 +585,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
 
         <div className="mt-4 grid grid-cols-3 gap-1.5 bg-[#02060d] p-1 rounded border border-cyan-500/30 text-xs">
           <button
+            type="button"
             onClick={() => setActiveTab('CLIENT_JOIN')}
             className={`py-2 px-2 rounded font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
               activeTab === 'CLIENT_JOIN'
@@ -430,6 +598,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
           </button>
 
           <button
+            type="button"
             onClick={() => setActiveTab('SHARE_APK')}
             className={`py-2 px-2 rounded font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
               activeTab === 'SHARE_APK'
@@ -442,6 +611,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
           </button>
 
           <button
+            type="button"
             onClick={() => setActiveTab('SCANNER')}
             className={`py-2 px-2 rounded font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
               activeTab === 'SCANNER'
@@ -459,7 +629,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
             {activeTab === 'CLIENT_JOIN' ? (
               <div className="bg-[#071324] border border-cyan-500/30 rounded p-3 flex flex-wrap items-center justify-between gap-2">
                 <div className="text-[11px] text-slate-300">
-                  ID 4-DIGIT UNTUK HP CLIENT BARU:
+                  ID 4-DIGIT UNTUK HP CLIENT:
                 </div>
                 <div className="flex items-center gap-2">
                   <input
@@ -474,6 +644,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
                     className="w-24 bg-[#02060d] border border-cyan-500/40 rounded px-2.5 py-1 text-xs font-bold text-cyan-300 text-center"
                   />
                   <button
+                    type="button"
                     onClick={() =>
                       setSelectedNodeId(String(Math.floor(1000 + Math.random() * 9000)))
                     }
@@ -491,6 +662,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   <button
+                    type="button"
                     onClick={() => setApkTargetRole('NODE_CLIENT')}
                     className={`p-2.5 rounded border text-left transition-colors cursor-pointer ${
                       apkTargetRole === 'NODE_CLIENT'
@@ -505,6 +677,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
                   </button>
 
                   <button
+                    type="button"
                     onClick={() => setApkTargetRole('FULL_SUITE')}
                     className={`p-2.5 rounded border text-left transition-colors cursor-pointer ${
                       apkTargetRole === 'FULL_SUITE'
@@ -525,10 +698,10 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
               <div className="text-[11px] tracking-widest text-cyan-400 font-semibold uppercase">
                 {activeTab === 'SHARE_APK'
                   ? 'SCAN BARCODE UNTUK DOWNLOAD / INSTALL WEBAPK'
-                  : `SCAN BARCODE DI HP CLIENT UNTUK AUTO-JOIN NODE (${selectedNodeId})`}
+                  : `SCAN BARCODE DI HP CLIENT / MASTER UNTUK PAIRING NODE (${selectedNodeId})`}
               </div>
 
-              <div className="p-2.5 bg-[#030812] border-2 border-cyan-400/70 rounded shadow-[0_0_25px_rgba(0,255,255,0.18)]">
+              <div className="p-2.5 bg-white border-2 border-cyan-400 rounded shadow-[0_0_25px_rgba(0,255,255,0.25)]">
                 {qrDataUrl ? (
                   <img
                     src={qrDataUrl}
@@ -536,7 +709,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
                     className="w-52 h-52 sm:w-60 sm:h-60 object-contain block"
                   />
                 ) : (
-                  <div className="w-52 h-52 sm:w-60 sm:h-60 flex items-center justify-center text-xs text-slate-500">
+                  <div className="w-52 h-52 sm:w-60 sm:h-60 flex items-center justify-center text-xs text-slate-700">
                     GENERATING BARCODE...
                   </div>
                 )}
@@ -568,9 +741,9 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
                   </>
                 ) : (
                   <>
-                    Arahkan kamera HP Client ke kode di atas. HP Client akan otomatis masuk ke{' '}
-                    <strong className="text-cyan-300">NODE MODE ({selectedNodeId})</strong> dan
-                    langsung terhubung (WebRTC Connected) ke Master ini.
+                    Scan kode QR di atas dari tab <strong className="text-amber-300">SCAN BARCODE</strong>{' '}
+                    pada perangkat Master maupun Client untuk langsung menautkan{' '}
+                    <strong className="text-cyan-300">NODE ({selectedNodeId})</strong> secara otomatis.
                   </>
                 )}
               </p>
@@ -583,6 +756,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
                   className="w-full bg-transparent text-slate-300 focus:outline-none truncate"
                 />
                 <button
+                  type="button"
                   onClick={handleCopyUrl}
                   className="flex items-center gap-1 px-2.5 py-1 bg-cyan-500/20 border border-cyan-400/50 text-cyan-200 rounded hover:bg-cyan-500/30 shrink-0 cursor-pointer"
                 >
@@ -604,6 +778,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
             <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
               <div className="flex flex-wrap items-center gap-2">
                 <button
+                  type="button"
                   onClick={handleDownloadBarcodeCard}
                   className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-cyan-500/20 border border-cyan-400 text-cyan-200 rounded hover:bg-cyan-500/30 transition-colors cursor-pointer"
                 >
@@ -612,6 +787,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
                 </button>
 
                 <button
+                  type="button"
                   onClick={handleNativeShare}
                   className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-emerald-500/20 border border-emerald-400 text-emerald-200 rounded hover:bg-emerald-500/30 transition-colors cursor-pointer"
                 >
@@ -622,6 +798,7 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
 
               {activeTab === 'SHARE_APK' && isInstallable && (
                 <button
+                  type="button"
                   onClick={() => install()}
                   className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold bg-amber-500/25 border border-amber-400 text-amber-200 rounded hover:bg-amber-500/35 cursor-pointer"
                 >
@@ -634,14 +811,43 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
         ) : (
           <div className="mt-4 space-y-4">
             <div className="bg-[#030812] border border-amber-500/45 rounded p-4 flex flex-col items-center text-center space-y-3">
-              <div className="flex items-center gap-2 text-xs font-bold text-amber-300">
-                <Camera className="w-4 h-4 text-amber-400" />
-                <span>OPTICAL QR / BARCODE SCANNER</span>
+              <div className="w-full flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-xs font-bold text-amber-300">
+                  <Camera className="w-4 h-4 text-amber-400" />
+                  <span>OPTICAL QR / BARCODE SCANNER</span>
+                </div>
+
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setFacingMode((prev) =>
+                        prev === 'environment' ? 'user' : 'environment'
+                      )
+                    }
+                    className="flex items-center gap-1 px-2.5 py-1 text-[10px] font-semibold bg-cyan-950/70 border border-cyan-500/40 text-cyan-200 rounded hover:border-cyan-400 cursor-pointer"
+                  >
+                    <SwitchCamera className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>
+                      KAMERA: {facingMode === 'environment' ? 'BELAKANG' : 'DEPAN'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setRetrySeed((s) => s + 1)}
+                    className="flex items-center gap-1 px-2.5 py-1 text-[10px] font-semibold bg-amber-950/70 border border-amber-500/40 text-amber-200 rounded hover:border-amber-400 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3 h-3 text-amber-400" />
+                    <span>ULANGI KAMERA</span>
+                  </button>
+                </div>
               </div>
 
               <div className="relative w-full max-w-sm aspect-square bg-black border-2 border-amber-400/60 rounded overflow-hidden flex items-center justify-center">
                 <video
                   ref={videoRef}
+                  autoPlay
                   playsInline
                   muted
                   className="w-full h-full object-cover"
@@ -653,9 +859,16 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
                 </div>
 
                 {!cameraActive && (
-                  <div className="absolute inset-0 bg-black/85 flex flex-col items-center justify-center p-4 text-xs text-slate-400 space-y-2">
+                  <div className="absolute inset-0 bg-black/85 flex flex-col items-center justify-center p-4 text-xs text-slate-300 space-y-3">
                     <ScanLine className="w-8 h-8 text-amber-400 animate-pulse" />
-                    <span>{scanError || 'MENGAKTIFKAN KAMERA...'}</span>
+                    <span>{scanError || 'MENGAKTIFKAN KAMERA OPTIK...'}</span>
+                    <button
+                      type="button"
+                      onClick={() => setRetrySeed((s) => s + 1)}
+                      className="px-3 py-1.5 bg-amber-500/25 border border-amber-400 text-amber-200 rounded font-semibold text-[11px] cursor-pointer"
+                    >
+                      AKTIFKAN / IZINKAN KAMERA
+                    </button>
                   </div>
                 )}
               </div>
@@ -673,7 +886,33 @@ export const BarcodeModal: React.FC<BarcodeModalProps> = ({
                 </div>
               )}
 
-              <div className="w-full pt-2 flex flex-wrap items-center justify-center gap-3">
+              {/* Input Manual Cepat 4-Digit jika kamera terhalang kondisi cahaya */}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (manualCodeInput.trim()) {
+                    handleDecodedPayload(manualCodeInput.trim());
+                  }
+                }}
+                className="w-full flex items-center gap-2 bg-[#06101e] border border-cyan-500/35 rounded p-2"
+              >
+                <input
+                  type="text"
+                  maxLength={4}
+                  value={manualCodeInput}
+                  onChange={(e) => setManualCodeInput(e.target.value.replace(/\D/g, ''))}
+                  placeholder="Atau ketik 4-Digit ID Node di sini..."
+                  className="flex-1 bg-[#02060d] border border-cyan-500/35 rounded px-2.5 py-1.5 text-xs text-cyan-200 placeholder:text-slate-500 focus:outline-none focus:border-cyan-400"
+                />
+                <button
+                  type="submit"
+                  className="px-3 py-1.5 text-xs font-bold bg-cyan-500/25 border border-cyan-400 text-cyan-200 rounded hover:bg-cyan-500/35 cursor-pointer whitespace-nowrap"
+                >
+                  PAIR ID
+                </button>
+              </form>
+
+              <div className="w-full pt-1 flex flex-wrap items-center justify-center gap-3">
                 <label className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-cyan-500/20 border border-cyan-400 text-cyan-200 rounded hover:bg-cyan-500/30 cursor-pointer">
                   <Upload className="w-3.5 h-3.5" />
                   <span>UPLOAD GAMBAR BARCODE (.PNG / .JPG)</span>

@@ -147,7 +147,20 @@ const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
+  iceCandidatePoolSize: 8,
 };
 
 function getSignalingWebSocketUrl(): string {
@@ -753,13 +766,13 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       const isSoloAllowed =
         !masterMutedRef.current &&
         (soloNodeIdRef.current === null || soloNodeIdRef.current === nodeId);
-      // Jika gainDb > 0, tambahkan amplifikasi ekstra melalui WebAudio speakerGain
-      speakerGain.gain.value = isSoloAllowed && db > 0 ? Math.pow(10, db / 20) - 1 : 0;
+      // Hubungkan gainNode -> speakerGain -> ctx.destination agar suara selalu keluar jernih baik di 0dB maupun +24dB
+      speakerGain.gain.value = isSoloAllowed ? 1.0 : 0.0;
 
       sourceNode.connect(gainNode);
       gainNode.connect(analyser);
       gainNode.connect(destNode);
-      sourceNode.connect(speakerGain);
+      gainNode.connect(speakerGain);
       speakerGain.connect(ctx.destination);
 
       const entry: AudioPipelineEntry = {
@@ -828,34 +841,38 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
   );
 
   const registerDataConnection = useCallback(
-    (nodeId: string, conn: DataConnection) => {
+    (rawNodeId: string, conn: DataConnection) => {
+      const nodeId = rawNodeId.replace('sigma-node-', '').trim();
       dataConnsRef.current.set(nodeId, conn);
 
       const bindDataPcHandlers = () => {
         if (!conn.peerConnection) return;
 
-        // 1. Pasang setupNegotiation pada RTCPeerConnection milik DataChannel
         const negHandler = setupNegotiation(conn.peerConnection, {
           dataChannel: conn,
           nodeId,
         });
         negotiationHandlersRef.current.set(nodeId, negHandler);
 
-        // 2. Pasang handleIncomingAudio pada peerConnection.ontrack milik DataChannel
-        // (Solusi Samsung Galaxy A26 5G ketika track audio dikirim melalui koneksi DataChannel yang sudah stabil)
-        conn.peerConnection.ontrack = (event: RTCTrackEvent) => {
-          handleIncomingAudio(event, {
-            audioId: nodeId,
-            onStreamAttached: (inboundStream) => {
-              attachWebRTCStreamToNode(nodeId, inboundStream);
-              setConnectionBanner(
-                `LIVE WEBRTC AUDIO TRACK ACTIVE (RENEGOTIATED): NODE (${nodeId})`
-              );
-            },
-            onAutoplaySuccess: () => setAutoplayBlocked(false),
-            onAutoplayBlocked: () => setAutoplayBlocked(true),
-          });
+        const pcWithFlag = conn.peerConnection as RTCPeerConnection & {
+          __sigmaTrackBound?: boolean;
         };
+        if (!pcWithFlag.__sigmaTrackBound) {
+          pcWithFlag.__sigmaTrackBound = true;
+          conn.peerConnection.addEventListener('track', (event: RTCTrackEvent) => {
+            handleIncomingAudio(event, {
+              audioId: nodeId,
+              onStreamAttached: (inboundStream) => {
+                attachWebRTCStreamToNode(nodeId, inboundStream);
+                setConnectionBanner(
+                  `LIVE WEBRTC AUDIO TRACK ACTIVE (RENEGOTIATED): NODE (${nodeId})`
+                );
+              },
+              onAutoplaySuccess: () => setAutoplayBlocked(false),
+              onAutoplayBlocked: () => setAutoplayBlocked(true),
+            });
+          });
+        }
       };
 
       bindDataPcHandlers();
@@ -865,7 +882,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         upsertConnectedClient(nodeId, { lastTelemetryAt: Date.now() });
         setConnectionBanner(`RTCPeerConnection CONNECTED: NODE (${nodeId})`);
 
-        // Minta Client untuk mendorong stream audio secara langsung apabila belum ada
         if (peerRef.current?.id) {
           try {
             conn.send({
@@ -923,21 +939,29 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
   /**
    * PERBAIKAN PENTING 2:
-   * Pasang event listener `peerConnection.ontrack` (dengan `handleIncomingAudio`)
-   * DAN `call.on('stream')` serta `setupNegotiation` agar MediaStream dari Client selalu tertangkap di Master.
+   * Gunakan `pc.addEventListener('track', ...)` (BUKAN menimpa `pc.ontrack = ...`)
+   * agar handler internal PeerJS `call.on('stream')` tetap berjalan dan suara dari Samsung A26 selalu muncul!
    */
   const registerMediaConnection = useCallback(
-    (nodeId: string, call: MediaConnection) => {
+    (rawNodeId: string, call: MediaConnection) => {
+      const nodeId = rawNodeId.replace('sigma-node-', '').trim();
       mediaCallsRef.current.set(nodeId, call);
+      upsertConnectedClient(nodeId, { lastTelemetryAt: Date.now() });
 
-      // 1. Listener native RTCPeerConnection.ontrack + setupNegotiation
       const bindOnTrack = (pc?: RTCPeerConnection) => {
         if (!pc) return;
+        const pcWithFlag = pc as RTCPeerConnection & {
+          __sigmaMediaTrackBound?: boolean;
+        };
+        if (pcWithFlag.__sigmaMediaTrackBound) return;
+        pcWithFlag.__sigmaMediaTrackBound = true;
+
         setupNegotiation(pc, {
           dataChannel: dataConnsRef.current.get(nodeId) || null,
           nodeId,
         });
-        pc.ontrack = (event: RTCTrackEvent) => {
+
+        pc.addEventListener('track', (event: RTCTrackEvent) => {
           handleIncomingAudio(event, {
             audioId: nodeId,
             onStreamAttached: (inboundStream) => {
@@ -947,13 +971,13 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
             onAutoplaySuccess: () => setAutoplayBlocked(false),
             onAutoplayBlocked: () => setAutoplayBlocked(true),
           });
-        };
+        });
       };
 
       bindOnTrack(call.peerConnection);
 
-      // 2. Listener PeerJS call.on('stream')
       call.on('stream', (remoteStream) => {
+        bindOnTrack(call.peerConnection);
         handleIncomingAudio(
           { streams: [remoteStream] },
           {
@@ -978,13 +1002,15 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         removeDisconnectedClient(nodeId);
       });
     },
-    [attachWebRTCStreamToNode, removeDisconnectedClient]
+    [attachWebRTCStreamToNode, removeDisconnectedClient, upsertConnectedClient]
   );
 
   const connectToRemoteNode = useCallback(
-    (fourDigitId: string) => {
-      const cleaned = fourDigitId.trim();
-      if (!/^\d{4}$/.test(cleaned)) return;
+    (rawFourDigitId: string) => {
+      const cleaned = rawFourDigitId.replace('sigma-node-', '').trim();
+      if (!cleaned) return;
+
+      unlockAllAudioPlayback();
 
       const peer = peerRef.current;
       if (!peer || !peer.open) {
@@ -1008,7 +1034,12 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         registerMediaConnection(cleaned, call);
       }
     },
-    [createMasterOfferDummyStream, registerDataConnection, registerMediaConnection]
+    [
+      createMasterOfferDummyStream,
+      registerDataConnection,
+      registerMediaConnection,
+      unlockAllAudioPlayback,
+    ]
   );
 
   const disconnectNode = useCallback(
@@ -1071,12 +1102,13 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
   useEffect(() => {
     let isMounted = true;
     let reconnectTimer: number | null = null;
+    let wsFailCount = 0;
     const pcMap = peerConnections.current;
     const dcMap = nativeDataChannelsRef.current;
     const candQueueMap = pendingCandidatesRef.current;
 
     const connectMasterWebSocket = () => {
-      if (!isMounted) return;
+      if (!isMounted || wsFailCount >= 3) return;
       if (
         wsRef.current &&
         (wsRef.current.readyState === WebSocket.OPEN ||
@@ -1091,11 +1123,11 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
         ws.onopen = () => {
           if (!isMounted) return;
+          wsFailCount = 0;
           const regPayload = {
             type: 'register',
             id: 'MASTER',
           };
-          console.log('[MASTER-WS] WebSocket terbuka. Mengirim registrasi:', regPayload);
           ws.send(JSON.stringify(regPayload));
           setConnectionBanner(
             'MASTER ONLINE (ID: MASTER) · SIAP MENERIMA HINGGA 5 KLIEN BERSAMAAN'
@@ -1376,7 +1408,10 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
 
         ws.onclose = () => {
           if (!isMounted) return;
-          reconnectTimer = window.setTimeout(connectMasterWebSocket, 2500);
+          wsFailCount++;
+          if (wsFailCount < 3) {
+            reconnectTimer = window.setTimeout(connectMasterWebSocket, 3000);
+          }
         };
 
         ws.onerror = () => {
@@ -1385,7 +1420,7 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
           } catch {}
         };
       } catch {
-        reconnectTimer = window.setTimeout(connectMasterWebSocket, 3000);
+        wsFailCount++;
       }
     };
 
@@ -1410,72 +1445,149 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
     };
   }, []);
 
-  // Initialize Master PeerJS Broker (Fallback layer dengan ID tetap `sigma-master-main`)
+  // Initialize Master PeerJS Broker (Utama untuk Vercel + Jaringan Seluler Samsung A26)
   useEffect(() => {
-    const bindPeerListeners = (peerInstance: Peer) => {
+    let isMounted = true;
+    const secondaryPeers: Peer[] = [];
+
+    const bindPeerListeners = (peerInstance: Peer, isPrimary = false) => {
       peerInstance.on('open', (id) => {
-        setMasterPeerId(id);
+        if (!isMounted) return;
+        if (isPrimary || !peerRef.current || !peerRef.current.open) {
+          peerRef.current = peerInstance;
+          setMasterPeerId(id);
+        }
+        setConnectionBanner(
+          `MASTER ONLINE (${id}) · SIAP MENERIMA KONEKSI AUDIO & GPS REAL-TIME`
+        );
       });
 
       peerInstance.on('call', (incomingCall) => {
-        const metaNodeId =
+        if (!isMounted) return;
+        const metaNodeId = String(
           incomingCall.metadata?.nodeId ||
-          incomingCall.peer.replace('sigma-node-', '');
+            incomingCall.peer.replace('sigma-node-', '')
+        ).trim();
 
         if (metaNodeId) {
-          const isExisting = clientsRef.current.some((c) => c.nodeId === metaNodeId);
+          const isExisting = clientsRef.current.some(
+            (c) => c.nodeId === metaNodeId
+          );
           if (!isExisting && clientsRef.current.length >= MAX_CLIENTS) return;
 
-          registerMediaConnection(metaNodeId, incomingCall);
+          // Jawab panggilan terlebih dahulu agar incomingCall.peerConnection terbentuk oleh PeerJS,
+          // kemudian pasang listener track tanpa menimpa handler internal PeerJS!
           incomingCall.answer();
-          if (incomingCall.peerConnection) {
-            incomingCall.peerConnection.ontrack = (event: RTCTrackEvent) => {
-              handleIncomingAudio(event, {
-                audioId: metaNodeId,
-                onStreamAttached: (inboundStream) => {
-                  attachWebRTCStreamToNode(metaNodeId, inboundStream);
-                  setConnectionBanner(
-                    `LIVE WEBRTC AUDIO TRACK ACTIVE: NODE (${metaNodeId})`
-                  );
-                },
-                onAutoplaySuccess: () => setAutoplayBlocked(false),
-                onAutoplayBlocked: () => setAutoplayBlocked(true),
-              });
-            };
-          }
+          registerMediaConnection(metaNodeId, incomingCall);
         }
       });
 
       peerInstance.on('connection', (conn) => {
-        const metaNodeId =
-          conn.metadata?.nodeId || conn.peer.replace('sigma-node-', '');
+        if (!isMounted) return;
+        const metaNodeId = String(
+          conn.metadata?.nodeId || conn.peer.replace('sigma-node-', '')
+        ).trim();
         if (metaNodeId) {
-          const isExisting = clientsRef.current.some((c) => c.nodeId === metaNodeId);
+          const isExisting = clientsRef.current.some(
+            (c) => c.nodeId === metaNodeId
+          );
           if (!isExisting && clientsRef.current.length >= MAX_CLIENTS) return;
           registerDataConnection(metaNodeId, conn);
         }
       });
+
+      peerInstance.on('disconnected', () => {
+        if (!isMounted) return;
+        try {
+          peerInstance.reconnect();
+        } catch {}
+      });
     };
 
     const primaryMasterId = 'sigma-master-main';
-    const peer = new Peer(primaryMasterId, { debug: 0 });
+    const peer = new Peer(primaryMasterId, {
+      debug: 0,
+      config: RTC_CONFIG,
+      pingInterval: 5000,
+    });
     peerRef.current = peer;
-    bindPeerListeners(peer);
+    bindPeerListeners(peer, true);
 
     peer.on('error', (err: { type?: string }) => {
+      if (!isMounted) return;
       if (err?.type === 'unavailable-id') {
-        const backupId = `sigma-master-${Math.floor(1000 + Math.random() * 9000)}`;
-        const backupPeer = new Peer(backupId, { debug: 0 });
-        peerRef.current = backupPeer;
-        bindPeerListeners(backupPeer);
+        // Gunakan slot deterministik 'sigma-master-slot-1' yang juga di-dial otomatis oleh Client!
+        const slot1Peer = new Peer('sigma-master-slot-1', {
+          debug: 0,
+          config: RTC_CONFIG,
+          pingInterval: 5000,
+        });
+        secondaryPeers.push(slot1Peer);
+        peerRef.current = slot1Peer;
+        bindPeerListeners(slot1Peer, true);
+
+        slot1Peer.on('error', (slotErr: { type?: string }) => {
+          if (!isMounted) return;
+          if (slotErr?.type === 'unavailable-id') {
+            const backupId = `sigma-master-${Math.floor(
+              1000 + Math.random() * 9000
+            )}`;
+            const backupPeer = new Peer(backupId, {
+              debug: 0,
+              config: RTC_CONFIG,
+              pingInterval: 5000,
+            });
+            secondaryPeers.push(backupPeer);
+            peerRef.current = backupPeer;
+            bindPeerListeners(backupPeer, true);
+          }
+        });
       }
     });
+
+    // Watchdog 3.5 detik: Jika ada Client yang sudah terhubung DataChannel namun stream audionya
+    // belum masuk (misal karena user baru saja mengklik Allow Mic di HP Samsung A26),
+    // minta ulang & panggil stream audio dari Client tersebut secara otomatis!
+    const audioWatchdog = window.setInterval(() => {
+      if (!isMounted) return;
+      const activePeer = peerRef.current;
+      if (!activePeer || !activePeer.open) return;
+
+      clientsRef.current.forEach((client) => {
+        if (client.connectionStatus === 'connected' && !client.hasAudioStream) {
+          const dc = dataConnsRef.current.get(client.nodeId);
+          if (dc && dc.open) {
+            try {
+              dc.send({
+                type: 'SIGMA_REQUEST_AUDIO_STREAM',
+                masterPeerId: activePeer.id,
+              });
+            } catch {}
+          }
+          const existingCall = mediaCallsRef.current.get(client.nodeId);
+          if (!existingCall || !existingCall.open) {
+            try {
+              const offerStream = createMasterOfferDummyStream();
+              const call = activePeer.call(
+                `sigma-node-${client.nodeId}`,
+                offerStream
+              );
+              if (call) {
+                registerMediaConnection(client.nodeId, call);
+              }
+            } catch {}
+          }
+        }
+      });
+    }, 3500);
 
     const pipelines = pipelinesRef.current;
     const dataConns = dataConnsRef.current;
     const mediaCalls = mediaCallsRef.current;
 
     return () => {
+      isMounted = false;
+      clearInterval(audioWatchdog);
       pipelines.forEach((entry) => {
         if (entry.recorder && entry.recorder.state === 'recording') {
           try {
@@ -1488,10 +1600,18 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       mediaCalls.forEach((c) => c.close());
       dataConns.clear();
       mediaCalls.clear();
-      peer.destroy();
+      try {
+        peer.destroy();
+      } catch {}
+      secondaryPeers.forEach((p) => {
+        try {
+          p.destroy();
+        } catch {}
+      });
     };
   }, [
     attachWebRTCStreamToNode,
+    createMasterOfferDummyStream,
     registerDataConnection,
     registerMediaConnection,
   ]);
@@ -1639,16 +1759,20 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         audioEl.volume = 1.0;
       }
 
-      // Update WebAudio GainNode
+      // Update WebAudio GainNode & SpeakerGain
       const entry = pipelinesRef.current.get(c.nodeId);
       if (entry && audioCtxRef.current) {
+        if (audioCtxRef.current.state === 'suspended') {
+          audioCtxRef.current.resume().catch(() => {});
+        }
         const now = audioCtxRef.current.currentTime;
         const linearGain = Math.pow(10, c.gainDb / 20);
         entry.gainNode.gain.setTargetAtTime(linearGain, now, 0.04);
-
-        const extraBoost =
-          shouldPlayToSpeaker && c.gainDb > 0 ? linearGain - 1 : 0;
-        entry.speakerGain.gain.setTargetAtTime(extraBoost, now, 0.04);
+        entry.speakerGain.gain.setTargetAtTime(
+          shouldPlayToSpeaker ? 1.0 : 0.0,
+          now,
+          0.04
+        );
       }
     });
   }, [clients, soloNodeId, masterMuted]);

@@ -33,17 +33,18 @@ export default function App() {
     const m = params.get('mode')?.toUpperCase();
     if (m === 'MASTER') return 'MASTER';
     if (m === 'NODE' || m === 'CLIENT') return 'NODE';
+    if (params.get('id')) return 'NODE';
     return 'LANDING';
   });
 
   const [manualOverride, setManualOverride] = useState<boolean>(() => {
     const params = new URLSearchParams(window.location.search);
-    return Boolean(params.get('mode'));
+    return params.get('autorole') !== '1';
   });
 
   const [pairedNodeId, setPairedNodeId] = useState<string | undefined>(() => {
     const params = new URLSearchParams(window.location.search);
-    const id = params.get('id');
+    const id = params.get('id')?.replace('sigma-node-', '').trim();
     return id && /^\d{4}$/.test(id) ? id : undefined;
   });
 
@@ -59,7 +60,7 @@ export default function App() {
 
   const [clock, setClock] = useState<string>('18:21:54:00');
 
-  // Dynamic Role Assignment: Saat aplikasi dimuat di halaman awal, kirim { type: "REQUEST_ROLE" } ke WebSocket
+  // Dynamic Role Assignment: Aktif jika parameter ?autorole=1 digunakan
   useEffect(() => {
     if (manualOverride || role !== 'LANDING') return;
 
