@@ -164,11 +164,13 @@ export const Client: React.FC<ClientProps> = ({
   const [wakeLockActive, setWakeLockActive] = useState<boolean>(false);
   const [micStatus, setMicStatus] = useState<'READY' | 'DENIED' | 'PENDING'>('PENDING');
   const [audioRms, setAudioRms] = useState<number>(0);
+
+  // Default Gain saat Unmute adalah 3.0x (Vocal Isolation Boost) sesuai spesifikasi
   const [remoteAudioState, setRemoteAudioState] = useState<{
     gain: number;
     muted: boolean;
   }>({
-    gain: 1.0,
+    gain: 3.0,
     muted: false,
   });
 
@@ -212,7 +214,7 @@ export const Client: React.FC<ClientProps> = ({
   const isHandshakingRef = useRef<boolean>(false);
   const isConnectedRef = useRef<boolean>(false);
 
-  // PeerJS Cloud Broker refs (utama saat di-deploy di Vercel)
+  // PeerJS Cloud Broker refs
   const peerRef = useRef<Peer | null>(null);
   const dataConnsRef = useRef<Map<string, DataConnection>>(new Map());
   const mediaCallsRef = useRef<Map<string, MediaConnection>>(new Map());
@@ -221,6 +223,7 @@ export const Client: React.FC<ClientProps> = ({
   const outboundStreamRef = useRef<MediaStream | null>(null);
   const passivePipelineRef = useRef<PassiveAudioPipeline | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+  const meterRafRef = useRef<number | null>(null);
 
   const gpsRef = useRef(gpsState);
   const batteryRef = useRef(batteryInfo);
@@ -330,7 +333,6 @@ export const Client: React.FC<ClientProps> = ({
 
       let sentCount = 0;
 
-      // a. Kirim melalui Native RTCDataChannel
       if (nativeDcRef.current && nativeDcRef.current.readyState === 'open') {
         try {
           nativeDcRef.current.send(JSON.stringify(payload));
@@ -338,7 +340,6 @@ export const Client: React.FC<ClientProps> = ({
         } catch {}
       }
 
-      // b. Kirim melalui WebSocket Signaling (jika tersedia)
       if (
         wsRef.current &&
         wsRef.current.readyState === WebSocket.OPEN &&
@@ -357,7 +358,6 @@ export const Client: React.FC<ClientProps> = ({
         } catch {}
       }
 
-      // c. Kirim melalui PeerJS DataConnection jika terbuka
       dataConnsRef.current.forEach((conn) => {
         if (conn.open) {
           try {
@@ -375,115 +375,247 @@ export const Client: React.FC<ClientProps> = ({
   );
 
   /**
-   * 4. Akuisisi Mikrofon Samsung Galaxy A26 Safe Mode:
-   * - Pada Samsung OneUI / Android 14+, mematikan autoGainControl (false) saat WebRTC aktif
-   *   menyebabkan HAL audio Android menurunkan preamp mikrofon ke 0 (bisu).
-   * - Oleh karena itu, gunakan autoGainControl: true dengan fallback bertingkat ke { audio: true }.
-   * - Selalu kembalikan hardware MediaStream asli (`rawStreamRef.current`) untuk WebRTC
-   *   agar AudioContext yang suspended di mobile TIDAK PERNAH membisukan suara yang dikirim ke Master!
+   * Sinkronisasi track audio aktif ke seluruh RTCRtpSender (Native PC & PeerJS MediaCalls)
+   * tanpa memutus koneksi WebRTC.
+   */
+  const syncActiveAudioTrackToAllSenders = useCallback((streamToSync: MediaStream) => {
+    const audioTrack = streamToSync.getAudioTracks()[0];
+    if (!audioTrack) return;
+
+    audioTrack.enabled = !remoteAudioStateRef.current.muted;
+
+    const allPcs: RTCPeerConnection[] = [];
+    if (nativePcRef.current) {
+      allPcs.push(nativePcRef.current);
+    }
+    mediaCallsRef.current.forEach((call) => {
+      if (call.peerConnection) {
+        allPcs.push(call.peerConnection);
+      }
+    });
+
+    allPcs.forEach((pc) => {
+      try {
+        pc.getSenders().forEach((sender) => {
+          if (sender.track && sender.track.kind === 'audio') {
+            if (sender.track.id !== audioTrack.id) {
+              sender.replaceTrack(audioTrack).catch(() => {});
+            } else {
+              sender.track.enabled = !remoteAudioStateRef.current.muted;
+            }
+          }
+        });
+      } catch {}
+    });
+  }, []);
+
+  /**
+   * ============================================================================
+   * 4. AKUISISI MIKROFON + VOCAL ISOLATION FILTER (300 Hz – 3400 Hz)
+   * ============================================================================
+   * - Menggunakan constraints ketat:
+   *     noiseSuppression: true, echoCancellation: true, autoGainControl: true
+   * - Memfilter suara melalui BiquadFilterNode Highpass (300 Hz) & Lowpass (3400 Hz)
+   *   serta GainNode (Default Unmute = 3.0, Mute = 0).
+   * - JANGAN PERNAH memanggil track.stop() atau men-suspend AudioContext saat MUTE!
    */
   const ensureMicrophoneStream = useCallback(async (): Promise<MediaStream | null> => {
-    const existing = rawStreamRef.current;
-    if (
-      existing &&
-      existing.active &&
-      existing.getAudioTracks().some((t) => t.readyState === 'live')
-    ) {
-      existing.getAudioTracks().forEach((t) => {
-        t.enabled = !remoteAudioStateRef.current.muted;
-      });
-      setMicStatus('READY');
-      return existing;
+    const existingRaw = rawStreamRef.current;
+    const hasLiveHardwareTrack = Boolean(
+      existingRaw &&
+        existingRaw.active &&
+        existingRaw.getAudioTracks().some((t) => t.readyState === 'live')
+    );
+
+    if (hasLiveHardwareTrack && existingRaw) {
+      const pipeline = passivePipelineRef.current;
+      if (pipeline) {
+        if (pipeline.audioContext.state === 'suspended') {
+          await pipeline.audioContext.resume().catch(() => {});
+        }
+        // Terapkan state mute/gain terbaru tanpa mematikan hardware mic
+        const isMuted = remoteAudioStateRef.current.muted;
+        existingRaw.getAudioTracks().forEach((t) => {
+          t.enabled = !isMuted;
+        });
+        pipeline.processedStream.getAudioTracks().forEach((t) => {
+          t.enabled = !isMuted;
+        });
+
+        const chosenStream =
+          pipeline.audioContext.state === 'running' &&
+          pipeline.processedStream.getAudioTracks().some((t) => t.readyState === 'live')
+            ? pipeline.processedStream
+            : existingRaw;
+
+        outboundStreamRef.current = chosenStream;
+        setMicStatus('READY');
+        return chosenStream;
+      }
     }
+
+    // Constraints ketat untuk Vocal Isolation (isolasi suara manusia dari kebisingan lingkungan)
+    const strictVocalConstraints: MediaStreamConstraints = {
+      audio: {
+        noiseSuppression: true,
+        echoCancellation: true,
+        autoGainControl: true,
+        channelCount: 1,
+      },
+      video: false,
+    };
 
     try {
       let stream: MediaStream;
       try {
-        // Stage 1: Samsung A26 optimal voice/ambient capture (autoGainControl: true menjaga preamp hardware aktif)
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: true,
-            channelCount: 1,
-          },
-          video: false,
-        });
+        stream = await navigator.mediaDevices.getUserMedia(strictVocalConstraints);
       } catch {
-        // Stage 2: Pure hardware default audio fallback
+        // Fallback apabila perangkat menolak salah satu properti constraint
         stream = await navigator.mediaDevices.getUserMedia({
           audio: true,
           video: false,
         });
       }
 
+      const isCurrentlyMuted = remoteAudioStateRef.current.muted;
       stream.getAudioTracks().forEach((track) => {
-        track.enabled = !remoteAudioStateRef.current.muted;
+        track.enabled = !isCurrentlyMuted;
       });
 
       rawStreamRef.current = stream;
-      outboundStreamRef.current = stream;
+
+      const pipeline = setupPassiveAudio(
+        stream,
+        nativeDcRef.current as unknown as DataChannelLike,
+        {
+          getExtraStreams: () => [rawStreamRef.current, outboundStreamRef.current],
+          getPeerConnections: () => [
+            nativePcRef.current,
+            ...Array.from(dataConnsRef.current.values()),
+            ...Array.from(mediaCallsRef.current.values()),
+          ],
+          getPeerInstance: () => peerRef.current,
+        },
+        (updatedState) => {
+          setRemoteAudioState(updatedState);
+          // Sinkronkan status enabled pada track (TANPA PERNAH memanggil track.stop()!)
+          if (rawStreamRef.current) {
+            rawStreamRef.current.getAudioTracks().forEach((t) => {
+              t.enabled = !updatedState.muted;
+            });
+          }
+          if (outboundStreamRef.current) {
+            outboundStreamRef.current.getAudioTracks().forEach((t) => {
+              t.enabled = !updatedState.muted;
+            });
+          }
+          setTimeout(() => transmitTelemetryPacket(), 30);
+        }
+      );
+
+      // Sinkronkan state awal (misal jika sedang MUTE atau memiliki Gain tertentu)
+      pipeline.setRemoteGain(remoteAudioStateRef.current.gain || 3.0);
+      pipeline.setRemoteMute(remoteAudioStateRef.current.muted);
+
+      passivePipelineRef.current = pipeline;
+
+      // Coba aktifkan AudioContext sekarang juga
+      if (pipeline.audioContext.state === 'suspended') {
+        await pipeline.audioContext.resume().catch(() => {});
+      }
+
+      // Begitu AudioContext running, pastikan sender WebRTC memakai processedStream
+      // (hasil filter Vocal Isolation 300Hz-3400Hz + GainNode 3.0x)
+      pipeline.audioContext.onstatechange = () => {
+        if (
+          pipeline.audioContext.state === 'running' &&
+          pipeline.processedStream.getAudioTracks().length > 0
+        ) {
+          outboundStreamRef.current = pipeline.processedStream;
+          syncActiveAudioTrackToAllSenders(pipeline.processedStream);
+        }
+      };
+
+      const activeOut =
+        pipeline.audioContext.state === 'running' &&
+        pipeline.processedStream.getAudioTracks().length > 0
+          ? pipeline.processedStream
+          : stream;
+
+      outboundStreamRef.current = activeOut;
+      syncActiveAudioTrackToAllSenders(activeOut);
       setMicStatus('READY');
 
-      try {
-        const pipeline = setupPassiveAudio(
-          stream,
-          nativeDcRef.current as unknown as DataChannelLike,
-          {
-            getExtraStreams: () => [rawStreamRef.current, outboundStreamRef.current],
-            getPeerConnections: () => [
-              nativePcRef.current,
-              ...Array.from(dataConnsRef.current.values()),
-              ...Array.from(mediaCallsRef.current.values()),
-            ],
-            getPeerInstance: () => peerRef.current,
-          },
-          (updatedState) => {
-            setRemoteAudioState(updatedState);
-            if (rawStreamRef.current) {
-              rawStreamRef.current.getAudioTracks().forEach((t) => {
-                t.enabled = !updatedState.muted;
-              });
-            }
-            setTimeout(() => transmitTelemetryPacket(), 30);
-          }
-        );
+      // Meter RMS lokal dari sinyal yang telah difilter (300Hz - 3400Hz)
+      if (meterRafRef.current) {
+        cancelAnimationFrame(meterRafRef.current);
+      }
+      const analyser = pipeline.audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      pipeline.gainNode.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
 
-        passivePipelineRef.current = pipeline;
+      const updateMeter = () => {
+        if (!rawStreamRef.current || !rawStreamRef.current.active) return;
+        analyser.getByteTimeDomainData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) {
+          const norm = (data[i] - 128) / 128;
+          sum += norm * norm;
+        }
+        const rms = remoteAudioStateRef.current.muted
+          ? 0
+          : Math.min(100, Math.round(Math.sqrt(sum / data.length) * 260));
+        setAudioRms(rms);
+        meterRafRef.current = requestAnimationFrame(updateMeter);
+      };
+      meterRafRef.current = requestAnimationFrame(updateMeter);
 
-        // Meter RMS lokal untuk indikator modulasi suara
-        const analyser = pipeline.audioContext.createAnalyser();
-        analyser.fftSize = 256;
-        pipeline.gainNode.connect(analyser);
-        const data = new Uint8Array(analyser.frequencyBinCount);
-
-        const updateMeter = () => {
-          if (!rawStreamRef.current || !rawStreamRef.current.active) return;
-          if (pipeline.audioContext.state === 'suspended') {
-            pipeline.audioContext.resume().catch(() => {});
-          }
-          analyser.getByteTimeDomainData(data);
-          let sum = 0;
-          for (let i = 0; i < data.length; i++) {
-            const norm = (data[i] - 128) / 128;
-            sum += norm * norm;
-          }
-          const rms = Math.min(100, Math.round(Math.sqrt(sum / data.length) * 260));
-          setAudioRms(rms);
-          requestAnimationFrame(updateMeter);
-        };
-        requestAnimationFrame(updateMeter);
-      } catch {}
-
-      return stream;
+      return activeOut;
     } catch {
       setMicStatus('DENIED');
       return null;
     }
-  }, [transmitTelemetryPacket]);
+  }, [syncActiveAudioTrackToAllSenders, transmitTelemetryPacket]);
 
-  // Resume AudioContext dan izin mikrofon saat pengguna menyentuh layar di HP Samsung
+  /**
+   * 5. STANDBY KEEP-ALIVE GUARD (Mencegah Mic Hang / Putus Saat Di-Mute Beberapa Menit):
+   * - Setiap 3 detik, pastikan AudioContext TIDAK PERNAH suspended.
+   * - Jika sedang UNMUTE tetapi OS Android sempat mematikan track hardware (`readyState === 'ended'`),
+   *   otomatis bangkitkan kembali stream mikrofon dan pasang ke koneksi WebRTC yang sedang berjalan.
+   */
   useEffect(() => {
+    const keepAliveTimer = window.setInterval(() => {
+      const pipeline = passivePipelineRef.current;
+      if (pipeline && pipeline.audioContext.state === 'suspended') {
+        pipeline.audioContext.resume().catch(() => {});
+      }
+
+      const raw = rawStreamRef.current;
+      const isHardwareDead =
+        !raw ||
+        !raw.active ||
+        raw.getAudioTracks().every((t) => t.readyState === 'ended');
+
+      if (isHardwareDead) {
+        ensureMicrophoneStream().catch(() => {});
+      } else if (raw) {
+        const shouldBeEnabled = !remoteAudioStateRef.current.muted;
+        raw.getAudioTracks().forEach((t) => {
+          if (t.enabled !== shouldBeEnabled) {
+            t.enabled = shouldBeEnabled;
+          }
+        });
+        if (pipeline) {
+          pipeline.processedStream.getAudioTracks().forEach((t) => {
+            if (t.enabled !== shouldBeEnabled) {
+              t.enabled = shouldBeEnabled;
+            }
+          });
+        }
+      }
+    }, 3000);
+
     const handleTouchUnlock = () => {
       if (
         passivePipelineRef.current &&
@@ -491,26 +623,29 @@ export const Client: React.FC<ClientProps> = ({
       ) {
         passivePipelineRef.current.audioContext.resume().catch(() => {});
       }
-      if (!rawStreamRef.current || !rawStreamRef.current.active) {
-        ensureMicrophoneStream().catch(() => {});
-      }
+      ensureMicrophoneStream().catch(() => {});
     };
+
     window.addEventListener('pointerdown', handleTouchUnlock, { passive: true });
     window.addEventListener('touchstart', handleTouchUnlock, { passive: true });
+
     return () => {
+      clearInterval(keepAliveTimer);
       window.removeEventListener('pointerdown', handleTouchUnlock);
       window.removeEventListener('touchstart', handleTouchUnlock);
     };
   }, [ensureMicrophoneStream]);
 
   /**
-   * 5. Fungsi Panggilan Audio PeerJS ke Master (Samsung A26 Reliable Audio Stream Push)
-   * Mengirimkan stream mikrofon hardware langsung ke Master via PeerJS MediaConnection.
+   * 6. Fungsi Panggilan Audio PeerJS ke Master
    */
   const pushAudioCallToMaster = useCallback(
     async (masterPeerIdToCall: string, forceRedial = false) => {
       const peer = peerRef.current;
       if (!peer || !peer.open || !masterPeerIdToCall) return;
+
+      const stream = (await ensureMicrophoneStream()) || outboundStreamRef.current || rawStreamRef.current;
+      if (!stream || stream.getAudioTracks().length === 0) return;
 
       const existingCall = mediaCallsRef.current.get(masterPeerIdToCall);
       if (existingCall && !forceRedial) {
@@ -523,19 +658,7 @@ export const Client: React.FC<ClientProps> = ({
               pc.iceConnectionState === 'completed' ||
               pc.iceConnectionState === 'checking'));
         if (isCallAlive) {
-          // Pastikan track audio pada sender tetap aktif & menggunakan stream terbaru
-          const stream = rawStreamRef.current;
-          if (stream && pc) {
-            const audioTrack = stream.getAudioTracks()[0];
-            if (audioTrack) {
-              audioTrack.enabled = !remoteAudioStateRef.current.muted;
-              pc.getSenders().forEach((sender) => {
-                if (sender.track?.kind === 'audio' && sender.track !== audioTrack) {
-                  sender.replaceTrack(audioTrack).catch(() => {});
-                }
-              });
-            }
-          }
+          syncActiveAudioTrackToAllSenders(stream);
           return;
         } else {
           try {
@@ -544,9 +667,6 @@ export const Client: React.FC<ClientProps> = ({
           mediaCallsRef.current.delete(masterPeerIdToCall);
         }
       }
-
-      const stream = (await ensureMicrophoneStream()) || rawStreamRef.current;
-      if (!stream || stream.getAudioTracks().length === 0) return;
 
       stream.getAudioTracks().forEach((t) => {
         t.enabled = !remoteAudioStateRef.current.muted;
@@ -568,11 +688,13 @@ export const Client: React.FC<ClientProps> = ({
         });
       } catch {}
     },
-    [ensureMicrophoneStream]
+    [ensureMicrophoneStream, syncActiveAudioTrackToAllSenders]
   );
 
   /**
-   * 6. Penanganan Pesan Komando & Permintaan Stream Audio dari Master
+   * 7. Penanganan Pesan Komando Jarak Jauh dari Master (`SET_MUTE`, `SET_GAIN`, `EMERGENCY_WIPE`)
+   * - Saat `SET_MUTE` diterima: HANYA memanipulasi `GainNode.gain.value` (0 saat Mute, 3.0 saat Unmute)
+   *   dan `track.enabled = false / true` TANPA PERNAH memanggil `track.stop()` atau men-suspend AudioContext!
    */
   const handleMasterControlMessage = useCallback(
     async (rawMsg: unknown, fallbackMasterPeerId?: string) => {
@@ -610,26 +732,74 @@ export const Client: React.FC<ClientProps> = ({
       }
 
       if (msg.type === 'SET_GAIN' && typeof msg.value === 'number') {
-        passivePipelineRef.current?.setRemoteGain(msg.value);
+        const nextGain = msg.value > 0 ? msg.value : 3.0;
+        remoteAudioStateRef.current = {
+          ...remoteAudioStateRef.current,
+          gain: nextGain,
+        };
+        passivePipelineRef.current?.setRemoteGain(nextGain);
+        setRemoteAudioState((prev) => ({ ...prev, gain: nextGain }));
+        setTimeout(() => transmitTelemetryPacket(), 25);
         return;
       }
 
       if (msg.type === 'SET_MUTE') {
         const muted = Boolean(msg.value);
-        passivePipelineRef.current?.setRemoteMute(muted);
+        const unmuteGain =
+          remoteAudioStateRef.current.gain > 0
+            ? remoteAudioStateRef.current.gain
+            : 3.0;
+
+        remoteAudioStateRef.current = {
+          gain: unmuteGain,
+          muted,
+        };
+        setRemoteAudioState({
+          gain: unmuteGain,
+          muted,
+        });
+
+        // 1. Update GainNode (0 saat Mute, 3.0 / unmuteGain saat Unmute) & track.enabled di pipeline
+        if (passivePipelineRef.current) {
+          if (!muted) {
+            passivePipelineRef.current.setRemoteGain(unmuteGain);
+          }
+          passivePipelineRef.current.setRemoteMute(muted);
+        }
+
+        // 2. Ubah HANYA properti track.enabled (JANGAN PERNAH memanggil track.stop()!)
         if (rawStreamRef.current) {
           rawStreamRef.current.getAudioTracks().forEach((t) => {
             t.enabled = !muted;
           });
         }
-        setRemoteAudioState((prev) => ({ ...prev, muted }));
+        if (outboundStreamRef.current) {
+          outboundStreamRef.current.getAudioTracks().forEach((t) => {
+            t.enabled = !muted;
+          });
+        }
+
+        // 3. Jika di-UNMUTE setelah beberapa menit, pastikan AudioContext aktif dan track masih live;
+        //    bila OS Android sempat memutus track hardware, otomatis pulihkan & replaceTrack!
+        if (!muted) {
+          const recoveredStream = await ensureMicrophoneStream();
+          if (recoveredStream) {
+            syncActiveAudioTrackToAllSenders(recoveredStream);
+          }
+        }
+
         setTimeout(() => transmitTelemetryPacket(), 25);
       }
     },
-    [pushAudioCallToMaster, transmitTelemetryPacket]
+    [
+      ensureMicrophoneStream,
+      pushAudioCallToMaster,
+      syncActiveAudioTrackToAllSenders,
+      transmitTelemetryPacket,
+    ]
   );
 
-  // 7. Native WebSocket + RTCPeerConnection Layer (aktif bila backend /ws tersedia)
+  // 8. Native WebSocket + RTCPeerConnection Layer (aktif bila backend /ws tersedia)
   const createSamsungSafePeerConnection = useCallback(
     (stream: MediaStream | null): RTCPeerConnection => {
       if (nativePcRef.current) {
@@ -790,7 +960,10 @@ export const Client: React.FC<ClientProps> = ({
     isHandshakingRef.current = true;
 
     try {
-      const stream = (await ensureMicrophoneStream()) || rawStreamRef.current;
+      const stream =
+        (await ensureMicrophoneStream()) ||
+        outboundStreamRef.current ||
+        rawStreamRef.current;
       const pc = createSamsungSafePeerConnection(stream);
       const ws = wsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -807,7 +980,7 @@ export const Client: React.FC<ClientProps> = ({
     sendOfferOverWebSocket,
   ]);
 
-  // Bootstrap Mikrofon Terlebih Dahulu, Lalu WebSocket (jika bukan serverless Vercel)
+  // Bootstrap Mikrofon + Vocal Isolation Terlebih Dahulu, Lalu WebSocket
   useEffect(() => {
     let isMounted = true;
     let wsReconnectTimer: number | null = null;
@@ -815,9 +988,7 @@ export const Client: React.FC<ClientProps> = ({
     let wsFailCount = 0;
 
     const connectSignalingWebSocket = () => {
-      if (!isMounted) return;
-      // Jika di Vercel (/ws tidak ada dan gagal berulang kali), hemat resource dan fokus ke PeerJS Cloud
-      if (wsFailCount >= 3) return;
+      if (!isMounted || wsFailCount >= 3) return;
 
       if (
         wsRef.current &&
@@ -848,7 +1019,9 @@ export const Client: React.FC<ClientProps> = ({
           let pc = nativePcRef.current;
           if (!pc || pc.signalingState === 'closed') {
             const stream =
-              rawStreamRef.current || (await ensureMicrophoneStream());
+              (await ensureMicrophoneStream()) ||
+              outboundStreamRef.current ||
+              rawStreamRef.current;
             pc = createSamsungSafePeerConnection(stream);
           }
 
@@ -1019,8 +1192,8 @@ export const Client: React.FC<ClientProps> = ({
     transmitTelemetryPacket,
   ]);
 
-  // 8. Real Hardware Geolocation — ditunda 1.5 detik setelah mount agar dialog izin mikrofon
-  // di Samsung Galaxy A26 tidak bertabrakan dengan dialog izin GPS Android!
+  // 9. Real Hardware Geolocation — ditunda 1.5 detik setelah mount agar dialog izin mikrofon
+  // tidak bertabrakan dengan dialog izin GPS Android
   useEffect(() => {
     if (!('geolocation' in navigator)) {
       setGpsState((prev) => ({ ...prev, status: 'PERMISSION_DENIED' }));
@@ -1107,12 +1280,7 @@ export const Client: React.FC<ClientProps> = ({
     };
   }, [transmitTelemetryPacket]);
 
-  /**
-   * 9. PeerJS Cloud Signaling & WebRTC Media Engine (Utama untuk Vercel & Jaringan Seluler Samsung A26)
-   * - Menggunakan RTC_CONFIG lengkap dengan STUN + TURN Relay.
-   * - Menghubungi targetMasterId serta slot cadangan Master secara otomatis.
-   * - Menjawab panggilan masuk dari Master (`peer.on('call')`) dengan stream mikrofon asli.
-   */
+  // 10. PeerJS Cloud Signaling & WebRTC Media Engine
   useEffect(() => {
     let isMounted = true;
     const peerId = `sigma-node-${nodeId}`;
@@ -1171,10 +1339,8 @@ export const Client: React.FC<ClientProps> = ({
       }
       if (!peer.open) return;
 
-      // Pastikan mikrofon sudah siap
       await ensureMicrophoneStream();
 
-      // Daftar kandidat ID Master yang dicoba (targetMasterId + default slots)
       const masterCandidates = Array.from(
         new Set([targetMasterId, ...DEFAULT_MASTER_SLOTS])
       );
@@ -1192,7 +1358,6 @@ export const Client: React.FC<ClientProps> = ({
             }
           } catch {}
         } else {
-          // DataChannel sudah terbuka ke Master ini: pastikan panggilan audio juga aktif!
           await pushAudioCallToMaster(candidateMasterId, false);
           transmitTelemetryPacket();
         }
@@ -1207,9 +1372,11 @@ export const Client: React.FC<ClientProps> = ({
       autoDialPeerJsMaster();
     });
 
-    // Saat Master menelepon Node ini (misal lewat tombol LINK NODE atau Scan QR di Master)
     peer.on('call', async (incomingCall) => {
-      const stream = (await ensureMicrophoneStream()) || rawStreamRef.current;
+      const stream =
+        (await ensureMicrophoneStream()) ||
+        outboundStreamRef.current ||
+        rawStreamRef.current;
       if (stream) {
         stream.getAudioTracks().forEach((t) => {
           t.enabled = !remoteAudioStateRef.current.muted;
@@ -1231,7 +1398,6 @@ export const Client: React.FC<ClientProps> = ({
       }
     });
 
-    // Saat Master membuka DataConnection ke Node ini
     peer.on('connection', (conn) => {
       setupMasterDataConnection(conn);
     });
@@ -1280,12 +1446,11 @@ export const Client: React.FC<ClientProps> = ({
 
   return (
     <div className="min-h-screen bg-black text-slate-300 font-mono-tactical flex flex-col justify-between p-4 sm:p-6 select-none">
-      {/* Barcode Scanner & QR Modal untuk Client (bisa scan QR Master atau tampilkan QR Node sendiri) */}
+      {/* Barcode Scanner & QR Modal untuk Client */}
       <BarcodeModal
         isOpen={barcodeModalOpen}
         onClose={() => {
           setBarcodeModalOpen(false);
-          // Pastikan mikrofon kembali aktif setelah kamera scanner ditutup di HP Samsung
           setTimeout(() => {
             ensureMicrophoneStream().then(() => {
               pushAudioCallToMaster(targetMasterIdRef.current, true);
@@ -1316,7 +1481,7 @@ export const Client: React.FC<ClientProps> = ({
         }}
       />
 
-      {/* Top Header: Logo TNI AU di Pojok Kiri Atas, Navigasi & Barcode, Logo Petir di Pojok Kanan Atas */}
+      {/* Top Header */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-neutral-900 pb-3">
         <div className="flex items-center gap-2.5">
           <img
@@ -1401,7 +1566,7 @@ export const Client: React.FC<ClientProps> = ({
               }
             >
               {peerStatus === 'CONNECTED'
-                ? 'TERHUBUNG KE MASTER · TRANSMISI AUDIO AKTIF'
+                ? 'TERHUBUNG KE MASTER · VOCAL ISOLATION (300–3400Hz) AKTIF'
                 : 'AUTO-DISCOVERY & PAIRING SIAP'}
             </span>
           </div>
@@ -1464,22 +1629,22 @@ export const Client: React.FC<ClientProps> = ({
           </div>
 
           <div className="border border-neutral-900 bg-black p-3 rounded space-y-1">
-            <div className="text-[10px] text-neutral-500">WAKE LOCK</div>
-            <div className="flex items-center gap-1.5 font-semibold text-neutral-300">
-              <Lock className="w-3.5 h-3.5 text-cyan-500" />
-              <span>{wakeLockActive ? 'ACTIVE' : 'STANDBY'}</span>
+            <div className="text-[10px] text-neutral-500">VOCAL BANDPASS FILTER</div>
+            <div className="flex items-center gap-1.5 font-semibold text-emerald-400">
+              <Lock className="w-3.5 h-3.5 text-emerald-400" />
+              <span>300Hz – 3400Hz ({wakeLockActive ? 'WAKE ON' : 'STANDBY'})</span>
             </div>
           </div>
 
           <div className="border border-neutral-900 bg-black p-3 rounded space-y-1">
-            <div className="text-[10px] text-neutral-500">AMBIENT MIC STREAM</div>
+            <div className="text-[10px] text-neutral-500">VOCAL MIC STREAM</div>
             <div className="flex items-center gap-1.5 font-semibold text-neutral-300">
               <Mic className="w-3.5 h-3.5 text-cyan-500" />
               <span>
                 {micStatus === 'READY'
                   ? remoteAudioState.muted
-                    ? 'REMOTE MUTED'
-                    : `LIVE (${remoteAudioState.gain.toFixed(1)}x)`
+                    ? 'STANDBY MUTED (GAIN 0)'
+                    : `LIVE (GAIN ${remoteAudioState.gain.toFixed(1)}x)`
                   : micStatus === 'DENIED'
                   ? 'MIC BLOCKED (TAP SYNC)'
                   : 'CAPTURING...'}
@@ -1502,7 +1667,7 @@ export const Client: React.FC<ClientProps> = ({
           <div className="flex items-center justify-between text-[11px] text-neutral-500">
             <span className="flex items-center gap-1.5">
               <Activity className="w-3.5 h-3.5 text-cyan-500" />
-              <span>RAW AUDIO STREAM MODULATION</span>
+              <span>VOCAL ISOLATION (300–3400Hz) MODULATION</span>
             </span>
             <span className="text-cyan-400">{audioRms}%</span>
           </div>
@@ -1541,7 +1706,7 @@ export const Client: React.FC<ClientProps> = ({
       <div className="border-t border-neutral-900 pt-3 flex flex-wrap items-center justify-between gap-2 text-[11px] text-neutral-500">
         <div className="flex items-center gap-1.5">
           <ShieldAlert className="w-3.5 h-3.5 text-cyan-500/70" />
-          <span>AUTO-CONNECT AKTIF · KOMPATIBEL SAMSUNG GALAXY A26 &amp; VERCEL</span>
+          <span>STANDBY-SAFE MUTE · VOCAL ISOLATION 300–3400Hz · GAIN 3.0x</span>
         </div>
         <span>TARGET: {targetMasterId}</span>
       </div>

