@@ -323,10 +323,11 @@ export function handleIncomingAudio(
     audioEl.setAttribute('playsinline', '');
     audioEl.setAttribute('webkit-playsinline', '');
 
-    // Pastikan TIDAK ada atribut muted agar langsung terdengar
+    // Pastikan TIDAK ada atribut muted agar decoder WebRTC Chrome/Android tetap berjalan aktif,
+    // namun set volume = 0 agar suara mentah tidak bocor dan 100% suara keluar dari Telephony-Grade DSP Pipeline
     audioEl.muted = false;
     audioEl.removeAttribute('muted');
-    audioEl.volume = 1.0;
+    audioEl.volume = 0;
 
     // Styling offscreen 1x1px (bukan display:none) agar tidak di-suspend oleh Android Chrome / Samsung OneUI
     audioEl.style.position = 'fixed';
@@ -347,7 +348,7 @@ export function handleIncomingAudio(
   } else {
     audioEl.muted = false;
     audioEl.removeAttribute('muted');
-    audioEl.volume = 1.0;
+    audioEl.volume = 0;
   }
 
   // Pasang stream unik milik Klien tersebut ke srcObject
@@ -419,12 +420,9 @@ export function unlockAudioAutoplay(
 
   const playAttempts = targets.map(async (el) => {
     try {
-      // Pastikan atribut muted bersih sebelum play()
+      // Pastikan atribut muted bersih sebelum play() agar decoder WebRTC aktif
       el.muted = false;
       el.removeAttribute('muted');
-      if (el.volume === 0) {
-        el.volume = 1.0;
-      }
 
       const playPromise = el.play();
       if (playPromise !== undefined) {
