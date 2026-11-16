@@ -69,9 +69,7 @@ const ClientAudioElement: React.FC<{
       el.srcObject = stream;
     }
     el.muted = muted;
-    // Gunakan volume 0 pada elemen <audio> mentah agar decoder WebRTC Chrome/Android tetap aktif
-    // sementara 100% output suara yang terdengar berasal dari Telephony-Grade DSP Pipeline (AudioContext.destination)
-    el.volume = 0;
+    el.volume = 1.0;
 
     const p = el.play();
     if (p !== undefined) {
@@ -249,9 +247,6 @@ interface AudioPipelineEntry {
   stream: MediaStream;
   processedStream: MediaStream;
   sourceNode: MediaStreamAudioSourceNode;
-  highpassFilter: BiquadFilterNode;
-  lowpassFilter: BiquadFilterNode;
-  compressorNode: DynamicsCompressorNode;
   gainNode: GainNode;
   analyser: AnalyserNode;
   speakerGain: GainNode;
@@ -685,9 +680,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       }
       try {
         entry.sourceNode.disconnect();
-        entry.highpassFilter.disconnect();
-        entry.lowpassFilter.disconnect();
-        entry.compressorNode.disconnect();
         entry.gainNode.disconnect();
         entry.analyser.disconnect();
         entry.speakerGain.disconnect();
@@ -752,47 +744,13 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         }
         try {
           existing.sourceNode.disconnect();
-          existing.highpassFilter.disconnect();
-          existing.lowpassFilter.disconnect();
-          existing.compressorNode.disconnect();
           existing.gainNode.disconnect();
           existing.analyser.disconnect();
           existing.speakerGain.disconnect();
         } catch {}
       }
 
-      // ============================================================================
-      // TELEPHONY-GRADE DSP PIPELINE (MASTER AUDIO RECEIVER)
-      // Urutan Pipa Audio (Tanpa Noise Gate agar suara lingkungan tetap mengalir):
-      // 1. MediaStreamSource (event.streams[0])
-      // 2. Highpass Filter (150 Hz) -> Buang gemuruh angin/mesin
-      // 3. Lowpass Filter (4000 Hz) -> Buang desis frekuensi tinggi (fokus vokal telepon)
-      // 4. DynamicsCompressorNode (threshold: -35, knee: 10, ratio: 8, attack: 0.01, release: 0.25)
-      // 5. GainNode Eksisting (terhubung ke Slider UI Master) -> AudioContext.destination
-      // ============================================================================
-
-      // 1. TANGKAP STREAM: Ambil event.streams[0] (remoteStream)
       const sourceNode = ctx.createMediaStreamSource(remoteStream);
-
-      // 2. HIGHPASS FILTER (Buang gemuruh angin/mesin di bawah 150 Hz)
-      const highpassFilter = ctx.createBiquadFilter();
-      highpassFilter.type = 'highpass';
-      highpassFilter.frequency.value = 150;
-
-      // 3. LOWPASS FILTER (Buang desis statis frekuensi tinggi di atas 4000 Hz)
-      const lowpassFilter = ctx.createBiquadFilter();
-      lowpassFilter.type = 'lowpass';
-      lowpassFilter.frequency.value = 4000;
-
-      // 4. DYNAMICS COMPRESSOR (Perata Suara agar bisikan/suara jauh terangkat jernih)
-      const compressorNode = ctx.createDynamicsCompressor();
-      compressorNode.threshold.value = -35;
-      compressorNode.knee.value = 10;
-      compressorNode.ratio.value = 8;
-      compressorNode.attack.value = 0.01;
-      compressorNode.release.value = 0.25;
-
-      // 5. HUBUNGKAN KE GAIN NODE EKSISTING (Terintegrasi dengan Slider UI Master)
       const gainNode = ctx.createGain();
       const clientConfig = clientsRef.current.find((c) => c.nodeId === nodeId);
       const db = clientConfig ? clientConfig.gainDb : 0;
@@ -808,16 +766,10 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       const isSoloAllowed =
         !masterMutedRef.current &&
         (soloNodeIdRef.current === null || soloNodeIdRef.current === nodeId);
+      // Hubungkan gainNode -> speakerGain -> ctx.destination agar suara selalu keluar jernih baik di 0dB maupun +24dB
       speakerGain.gain.value = isSoloAllowed ? 1.0 : 0.0;
 
-      // Rangkai Pipa Audio secara berurutan:
-      // Stream -> Highpass (150Hz) -> Lowpass (4000Hz) -> Compressor -> GainNode -> Destination
-      sourceNode.connect(highpassFilter);
-      highpassFilter.connect(lowpassFilter);
-      lowpassFilter.connect(compressorNode);
-      compressorNode.connect(gainNode);
-
-      // Keluaran dari GainNode menuju Analyser (Visualizer), MediaRecorder (.webm), dan Speaker Master
+      sourceNode.connect(gainNode);
       gainNode.connect(analyser);
       gainNode.connect(destNode);
       gainNode.connect(speakerGain);
@@ -827,9 +779,6 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         stream: remoteStream,
         processedStream: destNode.stream,
         sourceNode,
-        highpassFilter,
-        lowpassFilter,
-        compressorNode,
         gainNode,
         analyser,
         speakerGain,
@@ -1805,11 +1754,11 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
       const shouldPlayToSpeaker =
         !masterMuted && (soloNodeId === null || soloNodeId === c.nodeId);
 
-      // Update elemen <audio autoPlay playsInline> (volume 0 agar tidak bocor suara mentah sebelum DSP)
+      // Update elemen <audio autoPlay playsInline>
       const audioEl = nodeAudioElsRef.current.get(c.nodeId);
       if (audioEl) {
         audioEl.muted = !shouldPlayToSpeaker;
-        audioEl.volume = 0;
+        audioEl.volume = 1.0;
       }
 
       // Update WebAudio GainNode & SpeakerGain
@@ -1900,47 +1849,18 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
     setClients((prev) =>
       prev.map((c) => {
         if (c.nodeId !== nodeId) return c;
-        const currentIdx = GAIN_STEPS.indexOf(c.gainDb);
-        const nextIdx = currentIdx >= 0 ? (currentIdx + 1) % GAIN_STEPS.length : 0;
+        const nextIdx = (GAIN_STEPS.indexOf(c.gainDb) + 1) % GAIN_STEPS.length;
         const nextGainDb = GAIN_STEPS[nextIdx];
-        const entry = pipelinesRef.current.get(nodeId);
-        if (entry && audioCtxRef.current) {
-          const linearGain = Math.pow(10, nextGainDb / 20);
-          entry.gainNode.gain.setTargetAtTime(
-            linearGain,
-            audioCtxRef.current.currentTime,
-            0.02
-          );
-        }
         // Basis sensitivitas GainNode Klien = 5.0x pada 0dB, meningkat sesuai step dB
         const remoteLinearGain = Number(
           (5.0 * Math.pow(10, nextGainDb / 20)).toFixed(2)
         );
         dispatchRemoteNodeCommand(nodeId, 'SET_GAIN', remoteLinearGain);
         setConnectionBanner(
-          `TELEPHONY DSP GAIN (${nodeId}): +${nextGainDb}dB (MASTER ${(Math.pow(10, nextGainDb / 20)).toFixed(1)}x)`
+          `REMOTE GAIN COMMAND SENT TO NODE (${nodeId}): +${nextGainDb}dB (GAIN ${remoteLinearGain}x)`
         );
         return { ...c, gainDb: nextGainDb };
       })
-    );
-  };
-
-  const handleSetClientGainDb = (nodeId: string, nextGainDb: number) => {
-    unlockAllAudioPlayback();
-    const entry = pipelinesRef.current.get(nodeId);
-    if (entry && audioCtxRef.current) {
-      if (audioCtxRef.current.state === 'suspended') {
-        audioCtxRef.current.resume().catch(() => {});
-      }
-      const linearGain = Math.pow(10, nextGainDb / 20);
-      entry.gainNode.gain.setTargetAtTime(
-        linearGain,
-        audioCtxRef.current.currentTime,
-        0.015
-      );
-    }
-    setClients((prev) =>
-      prev.map((c) => (c.nodeId === nodeId ? { ...c, gainDb: nextGainDb } : c))
     );
   };
 
@@ -2535,32 +2455,10 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
                       </button>
                     </div>
 
-                    <div className="flex flex-wrap items-center gap-3 text-xs text-slate-300">
-                      <div className="flex items-center gap-2 bg-[#061322] border border-cyan-500/30 rounded px-2.5 py-1">
-                        <span className="text-[10px] text-cyan-300 font-semibold whitespace-nowrap">
-                          DSP GAIN:
-                        </span>
-                        <input
-                          type="range"
-                          min={-12}
-                          max={24}
-                          step={1}
-                          value={client.gainDb}
-                          onChange={(e) =>
-                            handleSetClientGainDb(
-                              client.nodeId,
-                              Number(e.target.value)
-                            )
-                          }
-                          className="w-24 h-1.5 accent-cyan-400 bg-slate-800 rounded-lg cursor-pointer"
-                          title="Real-time Master Telephony DSP GainNode Slider (-12dB s/d +24dB)"
-                        />
-                        <span className="text-[11px] font-mono text-cyan-200 min-w-[42px] text-right">
-                          {client.gainDb > 0
-                            ? `+${client.gainDb}dB`
-                            : `${client.gainDb}dB`}
-                        </span>
-                      </div>
+                    <div className="flex items-center gap-3 text-xs text-slate-300">
+                      <span className="text-[11px] text-slate-400">
+                        Gain digital ({client.gainDb > 0 ? `+${client.gainDb}dB` : '0dB'})
+                      </span>
 
                       <div className="flex items-center gap-1.5 text-cyan-300 font-semibold">
                         <Signal className="w-3.5 h-3.5 text-cyan-400" />
