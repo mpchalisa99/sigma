@@ -957,9 +957,11 @@ export const Client: React.FC<ClientProps> = ({
         };
 
         ws.onerror = () => {
-          try {
-            ws.close();
-          } catch {}
+          if (ws.readyState === WebSocket.OPEN) {
+            try {
+              ws.close();
+            } catch {}
+          }
         };
       } catch {
         wsFailCount++;

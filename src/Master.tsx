@@ -1415,9 +1415,11 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         };
 
         ws.onerror = () => {
-          try {
-            ws.close();
-          } catch {}
+          if (ws.readyState === WebSocket.OPEN) {
+            try {
+              ws.close();
+            } catch {}
+          }
         };
       } catch {
         wsFailCount++;

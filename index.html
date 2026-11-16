@@ -2,6 +2,90 @@
 <html lang="en" class="dark">
   <head>
     <meta charset="UTF-8" />
+    <script>
+      (function () {
+        function isViteWsError(val) {
+          var str = val && (val.message || String(val)) || '';
+          return (
+            str.indexOf('WebSocket closed without opened') !== -1 ||
+            str.indexOf('failed to connect to websocket') !== -1 ||
+            str.indexOf('[vite]') !== -1
+          );
+        }
+        window.addEventListener(
+          'unhandledrejection',
+          function (e) {
+            if (isViteWsError(e.reason)) {
+              e.preventDefault();
+              e.stopImmediatePropagation();
+            }
+          },
+          true
+        );
+        window.addEventListener(
+          'error',
+          function (e) {
+            if (isViteWsError(e.message) || isViteWsError(e.error)) {
+              e.preventDefault();
+              e.stopImmediatePropagation();
+            }
+          },
+          true
+        );
+        var origError = console.error;
+        console.error = function () {
+          for (var i = 0; i < arguments.length; i++) {
+            if (isViteWsError(arguments[i])) return;
+          }
+          return origError.apply(console, arguments);
+        };
+        var NativeWS = window.WebSocket;
+        if (NativeWS) {
+          function PatchedWebSocket(url, protocols) {
+            var protoStr = protocols ? String(protocols) : '';
+            var urlStr = url ? String(url) : '';
+            if (
+              protoStr.indexOf('vite-hmr') !== -1 ||
+              protoStr.indexOf('vite-ping') !== -1 ||
+              urlStr.indexOf('token=') !== -1
+            ) {
+              var target = new EventTarget();
+              target.url = urlStr;
+              target.protocol = protoStr || 'vite-hmr';
+              target.readyState = 1;
+              target.CONNECTING = 0;
+              target.OPEN = 1;
+              target.CLOSING = 2;
+              target.CLOSED = 3;
+              target.send = function () {};
+              target.close = function () {
+                target.readyState = 3;
+              };
+              setTimeout(function () {
+                var openEv = new Event('open');
+                if (typeof target.onopen === 'function') target.onopen(openEv);
+                target.dispatchEvent(openEv);
+                var msgEv = new MessageEvent('message', {
+                  data: JSON.stringify({ type: 'connected' }),
+                });
+                if (typeof target.onmessage === 'function') target.onmessage(msgEv);
+                target.dispatchEvent(msgEv);
+              }, 10);
+              return target;
+            }
+            return protocols !== undefined
+              ? new NativeWS(url, protocols)
+              : new NativeWS(url);
+          }
+          PatchedWebSocket.prototype = NativeWS.prototype;
+          PatchedWebSocket.CONNECTING = NativeWS.CONNECTING;
+          PatchedWebSocket.OPEN = NativeWS.OPEN;
+          PatchedWebSocket.CLOSING = NativeWS.CLOSING;
+          PatchedWebSocket.CLOSED = NativeWS.CLOSED;
+          window.WebSocket = PatchedWebSocket;
+        }
+      })();
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>S.I.G.M.A. Remote Audio Telemetry Dashboard</title>
     <meta name="description" content="Tactical peer-to-peer WebRTC remote environmental audio telemetry, GPS tracking, and VOX automatic recording system." />
