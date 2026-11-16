@@ -1851,10 +1851,13 @@ export const Master: React.FC<MasterProps> = ({ onExit }) => {
         if (c.nodeId !== nodeId) return c;
         const nextIdx = (GAIN_STEPS.indexOf(c.gainDb) + 1) % GAIN_STEPS.length;
         const nextGainDb = GAIN_STEPS[nextIdx];
-        const remoteLinearGain = Number(Math.pow(10, nextGainDb / 20).toFixed(2));
+        // Basis sensitivitas GainNode Klien = 5.0x pada 0dB, meningkat sesuai step dB
+        const remoteLinearGain = Number(
+          (5.0 * Math.pow(10, nextGainDb / 20)).toFixed(2)
+        );
         dispatchRemoteNodeCommand(nodeId, 'SET_GAIN', remoteLinearGain);
         setConnectionBanner(
-          `REMOTE GAIN COMMAND SENT TO NODE (${nodeId}): +${nextGainDb}dB (${remoteLinearGain}x)`
+          `REMOTE GAIN COMMAND SENT TO NODE (${nodeId}): +${nextGainDb}dB (GAIN ${remoteLinearGain}x)`
         );
         return { ...c, gainDb: nextGainDb };
       })
